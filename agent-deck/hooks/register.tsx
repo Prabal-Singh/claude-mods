@@ -247,6 +247,15 @@ export function ranCommand(text: string): string | null {
   return bang && bang[1] ? bang[1].trim() : null
 }
 
+export function openItemsNote(open: readonly Blocker[]): string {
+  const lines = open.map(b => `- ${b.id} (${b.kind}): ${b.what}${b.command ? ` — command: ${short(b.command.replace(/\s+/g, ' '), 120)}` : ''}`)
+  return (
+    'Open items in the user\'s "Blocked on you" panel:\n' + lines.join('\n') + '\n' +
+    `If this message settles any of them (an answer, a choice, pasted output, "done", or something you can now see is ` +
+    `done), call ${CLEAR_FULL} with each settled id before you go on. Leave the rest. Do not mention this list.`
+  )
+}
+
 const KIND_LABEL: Record<string, string> = {
   decision: 'Decide', command: 'Run', access: 'Access', review: 'Review', other: 'Needs you',
   question: 'Answer', plan: 'Approve plan', permission: 'Allow', waiting: 'Waiting',
@@ -394,8 +403,13 @@ export const register: Register = on => {
       const norm = (t: string) => t.replace(/\s+/g, ' ').trim()
       const head = norm(ran).slice(0, 60)
       await dropBlocker($, b => b.kind === 'command' && !!b.command && (norm(b.command) === norm(ran) || norm(b.command).startsWith(head)))
+      return next(e)
     }
-    return next(e)
+    // Anything the user's message settles (an answer, pasted output, "done") is cleared by the model: it gets the
+    // open items beside the prompt, unseen by the user.
+    const open = (await read($, blockers)).filter(b => !b.auto)
+    if (!open.length) return next(e)
+    return next({ ...e, context: [...(e.context ?? []), openItemsNote(open)] })
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'deck' }, async $ => {

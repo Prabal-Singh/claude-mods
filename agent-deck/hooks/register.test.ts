@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-import { NAMES, actionLabel, adoptRows, commandKey, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
+import { NAMES, actionLabel, adoptRows, commandKey, openItemsNote, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
 import type { AgentRow } from '../types'
 
 const base = (id: string, over: Partial<AgentRow> = {}): AgentRow => ({
@@ -172,4 +172,14 @@ test('multi-line commands in a code block come whole, labelled by the step above
     { command: 'export K=2;\ncurl -X POST https://y', what: '3. Send a test message' },
     { command: 'echo two', what: '3. Send a test message' },
   ])
+})
+
+test('the open items ride beside the next prompt so the model can clear what the message settles', () => {
+  const note = openItemsNote([
+    { id: 'b1', kind: 'decision', what: 'Merge PR 465?', command: '', agent: '', since: 0, auto: false },
+    { id: 'cmd-x', kind: 'command', what: '2. Run the smoke test', command: 'scripts/smoke.sh\n--fast', agent: '', since: 0, auto: false },
+  ])
+  expect(note).toContain('- b1 (decision): Merge PR 465?')
+  expect(note).toContain('command: scripts/smoke.sh --fast')
+  expect(note).toContain('mcp__agent-deck__unblocked')
 })

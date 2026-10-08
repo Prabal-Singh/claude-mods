@@ -25,7 +25,8 @@ they go.
 - Any `! command` a reply hands you to run.
 - Open questions, plans waiting for approval, permission prompts, and subagents that are waiting.
 
-Items clear when they are resolved, when you run the command, or when you press Done. A newer reply's commands
+Items clear when they are resolved, when you run the command, or when you press Done. Each message you send carries
+the open items (unseen), so when your message settles one ("go with B", pasted output, "done") Claude clears it. A newer reply's commands
 replace the previous reply's, commands read from replies expire after 2 hours, and flagged items after 24 hours.
 
 **Names.** Every subagent gets a name, so you can refer to it and message it: Vox Machina, in order. `kiki`, `vex`,
