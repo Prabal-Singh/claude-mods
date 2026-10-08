@@ -230,13 +230,24 @@ export function userCommands(text: string): { command: string; what: string }[] 
       inFence = !inFence
       continue
     }
-    const m = /^\s*(?:[-*]\s+|\d+[.)]\s+)?`?!\s+(.+?)`?\s*$/.exec(line)
-    if (!m || !m[1] || m[1].length < 2) {
+    const m = /^\s*(?:[-*]\s+|\d+[.)]\s+)?(`)?!\s+(.+?)\s*$/.exec(line)
+    if (!m || !m[2] || m[2].length < 2) {
       const label = labelLine(line)
       if (label) lastLabel = label
       continue
     }
-    const parts = [m[1]]
+    let first = m[2]
+    let what = lastLabel
+    if (m[1]) {
+      // `! cmd`: what it does, all on one line: the command ends at the closing backtick.
+      const close = first.indexOf('`')
+      if (close >= 0) {
+        const after = first.slice(close + 1).replace(/^[\s:：—–-]+/, '').trim()
+        first = first.slice(0, close)
+        if (after) what = after
+      }
+    }
+    const parts = [first.trim()]
     while (i + 1 < lines.length) {
       const nextLine = lines[i + 1] ?? ''
       const prev = parts[parts.length - 1] ?? ''
@@ -247,7 +258,7 @@ export function userCommands(text: string): { command: string; what: string }[] 
       parts.push(nextLine.trim())
       i++
     }
-    out.push({ command: parts.join('\n').trim(), what: short(lastLabel || 'Run this command', 140) })
+    out.push({ command: parts.join('\n').trim(), what: short(what || 'Run this command', 140) })
   }
   return out
 }
@@ -615,10 +626,8 @@ export const register: Register = on => {
     const blocked = await read($, blockers)
     const ORDER = ['decision', 'access', 'review', 'question', 'plan', 'permission', 'command', 'other', 'waiting']
     const rank = (b: Blocker) => (ORDER.indexOf(b.kind) + 1 || ORDER.length) * 2 + Number(b.auto)
-    const waiting = rows.filter(r => r.status === 'waiting' && !blocked.some(b => b.agent && b.agent === r.name))
     const needs: Blocker[] = [
       ...[...blocked].sort((a, b) => rank(a) - rank(b) || a.since - b.since),
-      ...waiting.map(r => ({ id: `wait-${r.id}`, kind: 'waiting', what: `${r.name || short(r.description, 40)} is waiting`, command: '', agent: r.name, since: r.lastActivity, auto: true })),
     ]
     const half = Math.max(6, Math.floor((e.props.scroll?.bodyRows ?? 24) / 2))
     const width = Math.max(24, e.props.bodyColumns ?? 56)

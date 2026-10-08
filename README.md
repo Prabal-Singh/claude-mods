@@ -24,7 +24,8 @@ they go.
 - Things Claude flags itself through the mod's `blocked_on_user` tool: a decision, a command only you can run (with
   Copy), access or credentials, a review.
 - Any `! command` a reply hands you to run.
-- Open questions, plans waiting for approval, permission prompts, and subagents that are waiting.
+- Open questions, plans waiting for approval and permission prompts (an agent waiting on its own subagents is not
+  blocked on you, so it is not listed).
 
 Items clear when they are resolved, when you run the command, or when you press Done. Each message you send carries
 the open items (unseen), so when your message settles one ("go with B", pasted output, "done") Claude clears it. A newer reply's commands

@@ -240,3 +240,9 @@ test('a finished agent frees its name; running agents and fresh reservations hol
   expect(namesInUse(map, [{ name: 'vax', at: 0 }])).toEqual(['vex', 'vax'])
   expect(namesInUse(map, [{ name: 'kiki', at: 0 }])).toEqual(['vex'])
 })
+
+test('an inline `! cmd`: description ends at the backtick and is labelled by its description', () => {
+  const found = userCommands('Two items in your panel\n- `! bash /tmp/im-history.sh`: the raw webhook bodies, which unblock tapbacks.')
+  expect(found).toEqual([{ command: 'bash /tmp/im-history.sh', what: 'the raw webhook bodies, which unblock tapbacks.' }])
+  expect(userCommands('Run `! gcloud auth login` now')).toEqual([])
+})
