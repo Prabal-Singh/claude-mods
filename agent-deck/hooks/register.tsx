@@ -119,7 +119,7 @@ export function isLive(row: AgentRow): boolean {
 export function glyph(row: AgentRow, at: number): string {
   if (isLive(row) && at - row.lastActivity > STUCK_MS) return '⚠'
   return (
-    { running: '◐', pending: '○', waiting: '⏸', idle: '⏸', completed: '✓', failed: '✗', killed: '■' } as Record<string, string>
+    { running: '◐', pending: '○', waiting: '⏸', idle: '✓', completed: '✓', failed: '✗', killed: '■' } as Record<string, string>
   )[row.status] ?? '·'
 }
 
@@ -163,7 +163,7 @@ export function pruneFinished(map: AgentMap, at: number): AgentMap {
   const liveUnder = (id: string): boolean =>
     Object.values(map).some(r => r.parentId === id && (isLive(r) || liveUnder(r.id)))
   return Object.fromEntries(
-    Object.entries(map).filter(([id, r]) => isLive(r) || r.endedAt === null || at - r.endedAt <= DONE_TTL_MS || liveUnder(id)),
+    Object.entries(map).filter(([id, r]) => isLive(r) || at - (r.endedAt ?? r.lastActivity) <= DONE_TTL_MS || liveUnder(id)),
   )
 }
 
@@ -179,7 +179,7 @@ export function newRow(over: Partial<AgentRow> & { id: string }, at: number): Ag
 // Agents this mod never saw spawn (they started before it loaded): add them from the engine's list.
 export function adoptRows(map: AgentMap, listed: readonly AgentInfoLike[], at: number): AgentRow[] {
   return listed
-    .filter(info => !map[info.id] && ['running', 'pending', 'waiting', 'idle'].includes(info.status))
+    .filter(info => !map[info.id] && ['running', 'pending', 'waiting'].includes(info.status))
     .map(info =>
       newRow(
         {
@@ -610,6 +610,8 @@ export const register: Register = on => {
       ...waiting.map(r => ({ id: `wait-${r.id}`, kind: 'waiting', what: `${r.name || short(r.description, 40)} is waiting`, command: '', agent: r.name, since: r.lastActivity, auto: true })),
     ]
     const half = Math.max(6, Math.floor((e.props.scroll?.bodyRows ?? 24) / 2))
+    const width = Math.max(24, e.props.bodyColumns ?? 56)
+    const fit = (text: string, room: number) => (text.length > room ? `${text.slice(0, Math.max(1, room - 1))}…` : text)
     // Rows never shrink: they are cut whole. Running agents take two lines, finished ones one, an open row its details.
     const budget = half - 2
     const cost = (r: AgentRow) =>
@@ -648,23 +650,16 @@ export const register: Register = on => {
           const stats = live
             ? [took, `${row.tools} tools`, files, money(subtreeCost), row.current].filter(Boolean).join(' · ')
             : [took, files, money(subtreeCost)].filter(Boolean).join(' · ')
+          const room = Math.max(12, width - lead.length - 2)
+          const line1 = fit(live ? label : `${label} · ${stats}`, room)
           return (
             <Box key={row.id} flexDirection="column" flexShrink={0}>
               <Box flexDirection="row" flexShrink={0}>
                 <Text dimColor>{lead}</Text>
                 <Text color={color(row)}>{glyph(row, at)} </Text>
-                <Button key={`row-${row.id}`} plain dimColor={!live} label={label} onPress={() => update($, expanded, cur => (cur === row.id ? null : row.id))} />
-                {!live && (
-                  <Text dimColor wrap="truncate-end">
-                    {' '}· {stats}
-                  </Text>
-                )}
+                <Button key={`row-${row.id}`} plain dimColor={!live} label={line1} onPress={() => update($, expanded, cur => (cur === row.id ? null : row.id))} />
               </Box>
-              {live && (
-                <Text dimColor wrap="truncate-end">
-                  {cont}  {stats}
-                </Text>
-              )}
+              {live && <Text dimColor>{fit(`${cont}  ${stats}`, width)}</Text>}
               {isOpen && (
                 <Box flexDirection="column" flexShrink={0}>
                   <Text dimColor wrap="truncate-end">{cont}  {[row.type, row.model.replace(/^claude-/, '')].filter(Boolean).join(' · ')} · {row.tools} tools</Text>

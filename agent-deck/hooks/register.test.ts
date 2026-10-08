@@ -213,3 +213,18 @@ test('finished agents leave the panel 10 minutes after they end, unless a child 
   }
   expect(Object.keys(pruneFinished(map, 11 * 60 * 1000)).sort()).toEqual(['fresh', 'kid', 'live', 'parent'])
 })
+
+test('a long finished row is cut to the panel width, never squeezed to nothing; idle counts as done', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 'c1' }))
+  await $.agent.spawn({ prompt: 'x', description: 'Full iMessage real-line checklist script with many words', name: 'cassandra' } as never)
+  expect(glyph(base('i', { status: 'idle' }), 0)).toBe('✓')
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck', surface: 'terminal', component: 'Pane', requestId: 'agents',
+    props: { title: 'Agents', isFocused: true, bodyColumns: 40, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
+  })
+  const row = await ui.find({ key: 'row-c1' })
+  expect(String(row?.props.label ?? '')).toContain('cassandra')
+  expect(String(row?.props.label ?? '').length).toBeLessThanOrEqual(38)
+})
