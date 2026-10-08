@@ -10,6 +10,8 @@ const STUCK_MS = 5 * 60 * 1000
 // "Blocked on you" items go away by themselves after this long: commands read from a reply, and flagged items.
 const REPLY_COMMAND_TTL_MS = 2 * 60 * 60 * 1000
 const FLAG_TTL_MS = 24 * 60 * 60 * 1000
+// Finished agents leave the panel this long after they end (their pop-up already said how it went).
+const DONE_TTL_MS = 10 * 60 * 1000
 const MAY_SPAWN =
   '\n\nYou may spawn your own subagents (Agent tool) for parts of this task that split cleanly; give each a precise brief.'
 
@@ -156,6 +158,15 @@ function tokens(n: number): string {
   return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n)
 }
 
+// Drops finished agents that ended more than DONE_TTL_MS ago, keeping any with a running agent under them.
+export function pruneFinished(map: AgentMap, at: number): AgentMap {
+  const liveUnder = (id: string): boolean =>
+    Object.values(map).some(r => r.parentId === id && (isLive(r) || liveUnder(r.id)))
+  return Object.fromEntries(
+    Object.entries(map).filter(([id, r]) => isLive(r) || r.endedAt === null || at - r.endedAt <= DONE_TTL_MS || liveUnder(id)),
+  )
+}
+
 export function newRow(over: Partial<AgentRow> & { id: string }, at: number): AgentRow {
   return {
     name: '', description: '', type: '', parentId: null, model: '', status: 'running', prompt: '',
@@ -168,7 +179,7 @@ export function newRow(over: Partial<AgentRow> & { id: string }, at: number): Ag
 // Agents this mod never saw spawn (they started before it loaded): add them from the engine's list.
 export function adoptRows(map: AgentMap, listed: readonly AgentInfoLike[], at: number): AgentRow[] {
   return listed
-    .filter(info => !map[info.id] && info.status !== 'completed')
+    .filter(info => !map[info.id] && ['running', 'pending', 'waiting', 'idle'].includes(info.status))
     .map(info =>
       newRow(
         {
@@ -328,6 +339,12 @@ async function tick($: EngineInterface): Promise<void> {
   const waitingOn = await read($, blockers)
   if (waitingOn.length) {
     await dropBlocker($, b => !b.auto && at - b.since > (b.id.startsWith('cmd-') ? REPLY_COMMAND_TTL_MS : FLAG_TTL_MS))
+    await update($, now, () => at)
+  }
+  const before = await read($, agents)
+  const kept = pruneFinished(before, at)
+  if (Object.keys(kept).length !== Object.keys(before).length) {
+    await update($, agents, () => kept)
     await update($, now, () => at)
   }
   const rows = Object.values(await read($, agents))
@@ -593,6 +610,22 @@ export const register: Register = on => {
       ...waiting.map(r => ({ id: `wait-${r.id}`, kind: 'waiting', what: `${r.name || short(r.description, 40)} is waiting`, command: '', agent: r.name, since: r.lastActivity, auto: true })),
     ]
     const half = Math.max(6, Math.floor((e.props.scroll?.bodyRows ?? 24) / 2))
+    // Rows never shrink: they are cut whole. Running agents take two lines, finished ones one, an open row its details.
+    const budget = half - 2
+    const cost = (r: AgentRow) =>
+      (isLive(r) ? 2 : 1) + (open === r.id ? 4 + r.files.length + (r.result ? 2 : 0) : 0)
+    const shown: TreeLine[] = []
+    let used = 0
+    let hidden = 0
+    for (const line of lines) {
+      const need = cost(line.row)
+      if (used + need > budget && !(isLive(line.row) && used + need <= budget + 2)) {
+        hidden++
+        continue
+      }
+      shown.push(line)
+      used += need
+    }
     const color = (r: AgentRow) => {
       const g = glyph(r, at)
       return g === '⚠' ? 'warning' : g === '✓' ? 'success' : g === '✗' || g === '■' ? 'error' : 'claude'
@@ -600,40 +633,41 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-       <Box flexDirection="column" height={half} overflow="hidden">
+       <Box flexDirection="column" height={half} overflow="hidden" flexShrink={0}>
         {rows.length === 0 ? (
           <Text dimColor>No subagents yet. They show here as a tree when one starts.</Text>
         ) : (
           <Text bold>{head}</Text>
         )}
-        {lines.map(({ row, lead, cont, subtreeCost }) => {
+        {shown.map(({ row, lead, cont, subtreeCost }) => {
           const isOpen = open === row.id
           const took = `${row.joinedLate ? '≥' : ''}${elapsed((row.endedAt ?? at) - row.startedAt)}`
-          const stats = [took, `${row.tools} tools`, row.files.length ? `${row.files.length} file${row.files.length === 1 ? '' : 's'}` : '', money(subtreeCost)]
-            .filter(Boolean)
-            .join(' · ')
-          const sub = [row.type, row.model.replace(/^claude-/, '')].filter(Boolean).join(' · ')
+          const files = row.files.length ? `${row.files.length} file${row.files.length === 1 ? '' : 's'}` : ''
+          const label = row.name ? `${row.name} — ${short(row.description, 44)}` : short(row.description, 56)
+          const live = isLive(row)
+          const stats = live
+            ? [took, `${row.tools} tools`, files, money(subtreeCost), row.current].filter(Boolean).join(' · ')
+            : [took, files, money(subtreeCost)].filter(Boolean).join(' · ')
           return (
-            <Box key={row.id} flexDirection="column" marginTop={lead ? 0 : 1}>
-              <Box flexDirection="row">
+            <Box key={row.id} flexDirection="column" flexShrink={0}>
+              <Box flexDirection="row" flexShrink={0}>
                 <Text dimColor>{lead}</Text>
                 <Text color={color(row)}>{glyph(row, at)} </Text>
-                <Button
-                  key={`row-${row.id}`}
-                  plain
-                  label={row.name ? `${row.name} — ${short(row.description, 48)}` : short(row.description, 60)}
-                  onPress={() => update($, expanded, cur => (cur === row.id ? null : row.id))}
-                />
+                <Button key={`row-${row.id}`} plain dimColor={!live} label={label} onPress={() => update($, expanded, cur => (cur === row.id ? null : row.id))} />
+                {!live && (
+                  <Text dimColor wrap="truncate-end">
+                    {' '}· {stats}
+                  </Text>
+                )}
               </Box>
-              <Text dimColor wrap="truncate-end">
-                {cont}  {stats}
-              </Text>
-              <Text dimColor wrap="truncate-end">
-                {cont}  {sub}
-                {isLive(row) && row.current ? ` — ${row.current}` : ''}
-              </Text>
+              {live && (
+                <Text dimColor wrap="truncate-end">
+                  {cont}  {stats}
+                </Text>
+              )}
               {isOpen && (
-                <Box flexDirection="column">
+                <Box flexDirection="column" flexShrink={0}>
+                  <Text dimColor wrap="truncate-end">{cont}  {[row.type, row.model.replace(/^claude-/, '')].filter(Boolean).join(' · ')} · {row.tools} tools</Text>
                   <Text wrap="wrap">{cont}  Task: {short(row.prompt.replace(MAY_SPAWN, ''), 200)}</Text>
                   <Text dimColor>
                     {cont}  Tokens: {tokens(row.tokensIn + row.cacheRead + row.cacheWrite)} in · {tokens(row.tokensOut)} out
@@ -644,13 +678,14 @@ export const register: Register = on => {
                       {cont}    {tail(f)}
                     </Text>
                   ))}
-                  {row.recent.length > 0 && <Text dimColor>{cont}  Last: {row.recent.slice(-3).join(' → ')}</Text>}
+                  {row.recent.length > 0 && <Text dimColor wrap="truncate-end">{cont}  Last: {row.recent.slice(-3).join(' → ')}</Text>}
                   {row.result && <Text wrap="wrap">{cont}  Result: {short(row.result, 300)}</Text>}
                 </Box>
               )}
             </Box>
           )
         })}
+        {hidden > 0 && <Text dimColor>+{hidden} more not shown (oldest first) · click a row for details</Text>}
        </Box>
        <Text bold color={needs.length ? 'warning' : undefined}>
          {needs.length ? `Blocked on you (${needs.length})` : 'Blocked on you'}

@@ -1,6 +1,6 @@
 {
   "name": "agent-deck",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "A pane on the right that tracks this session's subagents as a tree: status, current action, files changed, tokens and cost",
   "types": "./types/index.d.ts",
   "author": {

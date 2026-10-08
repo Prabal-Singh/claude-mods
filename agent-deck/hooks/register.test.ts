@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-import { NAMES, actionLabel, adoptRows, commandKey, openItemsNote, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
+import { NAMES, actionLabel, adoptRows, commandKey, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
 import type { AgentRow } from '../types'
 
 const base = (id: string, over: Partial<AgentRow> = {}): AgentRow => ({
@@ -182,4 +182,34 @@ test('the open items ride beside the next prompt so the model can clear what the
   expect(note).toContain('- b1 (decision): Merge PR 465?')
   expect(note).toContain('command: scripts/smoke.sh --fast')
   expect(note).toContain('mcp__agent-deck__unblocked')
+})
+
+test('many agents in a small panel: whole rows, no squeezing, the rest counted', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  let n = 0
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: `a${++n}` }))
+  for (let i = 0; i < 15; i++) {
+    await $.agent.spawn({ prompt: 'x', description: `Task ${i}`, name: `agent${i}` } as never)
+    await clock.advance(1000)
+  }
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck', surface: 'terminal', component: 'Pane', requestId: 'agents',
+    props: { title: 'Agents', isFocused: true, bodyColumns: 56, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+  })
+  expect(await ui.find({ type: 'Text', text: /15 running/ })).toBeDefined()
+  expect(await ui.find({ key: 'row-a15' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /\+10 more not shown/ })).toBeDefined()
+  expect(await ui.find({ key: 'row-a1' })).toBeUndefined()
+})
+
+test('finished agents leave the panel 10 minutes after they end, unless a child still runs', () => {
+  const map = {
+    old: base('old', { status: 'completed', endedAt: 0 }),
+    fresh: base('fresh', { status: 'completed', endedAt: 9 * 60 * 1000 }),
+    parent: base('parent', { status: 'completed', endedAt: 0 }),
+    kid: base('kid', { parentId: 'parent' }),
+    live: base('live'),
+  }
+  expect(Object.keys(pruneFinished(map, 11 * 60 * 1000)).sort()).toEqual(['fresh', 'kid', 'live', 'parent'])
 })

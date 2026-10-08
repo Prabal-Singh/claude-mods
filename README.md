@@ -17,7 +17,8 @@ they go.
   under it.
 - What it is doing right now (`Edit …/app/x.py`, `Bash pytest -q`).
 - Click a row for the task it was given, tokens in and out, files changed, its last actions and its result.
-- A pop-up when an agent finishes or fails.
+- A pop-up when an agent finishes or fails. Finished agents take one line and leave the panel 10 minutes later.
+- Many agents: rows are cut whole, never squeezed. Running agents come first, then "+N more not shown".
 
 **Bottom half: Blocked on you.** Everything that stops progress until you act:
 - Things Claude flags itself through the mod's `blocked_on_user` tool: a decision, a command only you can run (with
