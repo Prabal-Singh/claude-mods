@@ -25,7 +25,8 @@ they go.
 - Any `! command` a reply hands you to run.
 - Open questions, plans waiting for approval, permission prompts, and subagents that are waiting.
 
-Items clear when they are resolved, when you run the command, or when you press Done.
+Items clear when they are resolved, when you run the command, or when you press Done. A newer reply's commands
+replace the previous reply's, commands read from replies expire after 2 hours, and flagged items after 24 hours.
 
 **Names.** Every subagent gets a name, so you can refer to it and message it: Vox Machina, in order. `kiki`, `vex`,
 `vax`, `grog`, `pike`, `scanlan`, `percy`… (then `kiki-2`). Two agents never share a name, even when they start in

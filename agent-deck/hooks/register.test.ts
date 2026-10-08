@@ -115,7 +115,7 @@ test('blocked on you: flagged items and open questions show in the lower half; D
       props: { title: 'Agents', isFocused: true, bodyColumns: 56, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
     })
     expect(await ui.find({ type: 'Text', text: /Blocked on you \(2\)/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /! gcloud auth login/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /\$ gcloud auth login/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /Merge PR 467\?/ })).toBeDefined()
     mounted.push(ui)
   }
@@ -144,8 +144,32 @@ test('commands handed to the user are found in a reply, and running one with ! i
     'gcloud secrets create S --project=P',
   ])
   expect(found[0]!.what).toBe('1. Deploy (also covers the earlier deploy)')
+  expect(found[1]!.what).toBe('2. Create the key secret')
   expect(ranCommand('<bash-input>gcloud auth login</bash-input>')).toBe('gcloud auth login')
   expect(ranCommand('! gcloud auth login')).toBe('gcloud auth login')
   expect(ranCommand('please run it')).toBe(null)
   expect(commandKey('a  b')).toBe(commandKey('a b'))
+})
+
+test('multi-line commands in a code block come whole, labelled by the step above, never by a fence', () => {
+  const reply = [
+    '**2. Run the smoke test**',
+    '```',
+    "! export A=1; curl -sS https://x \\",
+    '  -H "a: b"',
+    '```',
+    '3. Send a test message:',
+    '```bash',
+    '! export K=2;',
+    'curl -X POST https://y',
+    '',
+    '! echo two',
+    '```',
+  ].join('\n')
+  const found = userCommands(reply)
+  expect(found).toEqual([
+    { command: 'export A=1; curl -sS https://x \\\n-H "a: b"', what: '2. Run the smoke test' },
+    { command: 'export K=2;\ncurl -X POST https://y', what: '3. Send a test message' },
+    { command: 'echo two', what: '3. Send a test message' },
+  ])
 })

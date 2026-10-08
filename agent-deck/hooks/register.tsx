@@ -7,6 +7,9 @@ const PANE = 'agents'
 const TITLE = 'Agents'
 const TICK_MS = 2000
 const STUCK_MS = 5 * 60 * 1000
+// "Blocked on you" items go away by themselves after this long: commands read from a reply, and flagged items.
+const REPLY_COMMAND_TTL_MS = 2 * 60 * 60 * 1000
+const FLAG_TTL_MS = 24 * 60 * 60 * 1000
 const MAY_SPAWN =
   '\n\nYou may spawn your own subagents (Agent tool) for parts of this task that split cleanly; give each a precise brief.'
 
@@ -187,23 +190,46 @@ export function adoptRows(map: AgentMap, listed: readonly AgentInfoLike[], at: n
 export type AgentInfoLike = { id: string; name?: string; description: string; type: string; status: string; parentId?: string }
 
 // Commands a reply hands the user to run themselves: lines that start with "! " (Claude Code's run-it-yourself prefix),
-// in prose or inside code blocks. Each with the nearest line above it as its "what".
+// in prose or in code blocks. Inside a code block the lines after a "! " line, up to a blank line, the fence or the
+// next "! " line, belong to the same command; outside one, only after a line ending in a backslash. Each command's
+// "what" is the nearest real line above it (a heading or a numbered step), never a fence.
+const FENCE = /^\s*(```|~~~)/
+
+function labelLine(raw: string): string {
+  if (FENCE.test(raw) || /^[\s`~>#*_-]*$/.test(raw)) return ''
+  return raw.replace(/^[\s>#*-]+/, '').replace(/\*\*/g, '').replace(/[:：]\s*$/, '').trim()
+}
+
 export function userCommands(text: string): { command: string; what: string }[] {
   const out: { command: string; what: string }[] = []
   const lines = text.split('\n')
-  lines.forEach((line, i) => {
-    const m = /^\s*(?:[-*]\s+|\d+[.)]\s+)?`?!\s+(.+?)`?\s*$/.exec(line)
-    if (!m || !m[1] || m[1].length < 2) return
-    let what = ''
-    for (let j = i - 1; j >= 0 && j >= i - 4; j--) {
-      const above = (lines[j] ?? '').replace(/^[\s#>*-]*|```\w*|[:：]\s*$/g, '').trim()
-      if (above && !above.startsWith('!')) {
-        what = above
-        break
-      }
+  let inFence = false
+  let lastLabel = ''
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? ''
+    if (FENCE.test(line)) {
+      inFence = !inFence
+      continue
     }
-    out.push({ command: m[1].trim(), what: short(what || 'Run this command', 140) })
-  })
+    const m = /^\s*(?:[-*]\s+|\d+[.)]\s+)?`?!\s+(.+?)`?\s*$/.exec(line)
+    if (!m || !m[1] || m[1].length < 2) {
+      const label = labelLine(line)
+      if (label) lastLabel = label
+      continue
+    }
+    const parts = [m[1]]
+    while (i + 1 < lines.length) {
+      const nextLine = lines[i + 1] ?? ''
+      const prev = parts[parts.length - 1] ?? ''
+      const continues = inFence
+        ? nextLine.trim() !== '' && !FENCE.test(nextLine) && !/^\s*!\s/.test(nextLine)
+        : /\\\s*$/.test(prev) && nextLine.trim() !== ''
+      if (!continues) break
+      parts.push(nextLine.trim())
+      i++
+    }
+    out.push({ command: parts.join('\n').trim(), what: short(lastLabel || 'Run this command', 140) })
+  }
   return out
 }
 
@@ -233,8 +259,10 @@ export function kindLabel(kind: string): string {
 async function addBlocker($: EngineInterface, item: Omit<Blocker, 'id' | 'since'> & { id?: string }): Promise<Blocker> {
   const seq = (await read($, blockerSeq)) + 1
   await update($, blockerSeq, () => seq)
-  const full: Blocker = { ...item, id: item.id ?? `b${seq}`, since: await $.clock.now() }
-  await update($, blockers, list => [...list.filter(b => b.id !== full.id), full])
+  const id = item.id ?? `b${seq}`
+  const existing = (await read($, blockers)).find(b => b.id === id)
+  const full: Blocker = { ...item, id, since: existing?.since ?? (await $.clock.now()) }
+  await update($, blockers, list => (existing ? list.map(b => (b.id === id ? full : b)) : [...list, full]))
   if (!(await read($, opened))) await openPane($)
   return full
 }
@@ -287,6 +315,11 @@ async function tick($: EngineInterface): Promise<void> {
   if (adopted.length) {
     await update($, agents, cur => ({ ...cur, ...Object.fromEntries(adopted.map(r => [r.id, r])) }))
     if (!(await read($, opened))) await openPane($)
+  }
+  const waitingOn = await read($, blockers)
+  if (waitingOn.length) {
+    await dropBlocker($, b => !b.auto && at - b.since > (b.id.startsWith('cmd-') ? REPLY_COMMAND_TTL_MS : FLAG_TTL_MS))
+    await update($, now, () => at)
   }
   const rows = Object.values(await read($, agents))
   if (!rows.some(isLive)) return
@@ -487,8 +520,13 @@ export const register: Register = on => {
     if (!id) {
       await dropBlocker($, b => b.kind === 'permission' && !b.agent)
       // Fallback for replies that hand the user commands without flagging them.
-      const flagged = new Set((await read($, blockers)).map(b => b.command.replace(/\s+/g, ' ').trim()))
-      for (const c of userCommands(e.answer)) {
+      const found = userCommands(e.answer)
+      if (found.length) {
+        const keep = new Set(found.map(c => commandKey(c.command)))
+        await dropBlocker($, b => b.id.startsWith('cmd-') && !keep.has(b.id))
+      }
+      const flagged = new Set((await read($, blockers)).filter(b => !b.id.startsWith('cmd-')).map(b => b.command.replace(/\s+/g, ' ').trim()))
+      for (const c of found) {
         if (flagged.has(c.command.replace(/\s+/g, ' ').trim())) continue
         await addBlocker($, { id: commandKey(c.command), kind: 'command', what: c.what, command: c.command, agent: '', auto: false })
       }
@@ -533,9 +571,11 @@ export const register: Register = on => {
       money(total),
     ].filter(Boolean).join(' · ')
     const blocked = await read($, blockers)
+    const ORDER = ['decision', 'access', 'review', 'question', 'plan', 'permission', 'command', 'other', 'waiting']
+    const rank = (b: Blocker) => (ORDER.indexOf(b.kind) + 1 || ORDER.length) * 2 + Number(b.auto)
     const waiting = rows.filter(r => r.status === 'waiting' && !blocked.some(b => b.agent && b.agent === r.name))
     const needs: Blocker[] = [
-      ...[...blocked].sort((a, b) => Number(a.auto) - Number(b.auto) || a.since - b.since),
+      ...[...blocked].sort((a, b) => rank(a) - rank(b) || a.since - b.since),
       ...waiting.map(r => ({ id: `wait-${r.id}`, kind: 'waiting', what: `${r.name || short(r.description, 40)} is waiting`, command: '', agent: r.name, since: r.lastActivity, auto: true })),
     ]
     const half = Math.max(6, Math.floor((e.props.scroll?.bodyRows ?? 24) / 2))
@@ -602,27 +642,39 @@ export const register: Register = on => {
          {needs.length ? `Blocked on you (${needs.length})` : 'Blocked on you'}
        </Text>
        {needs.length === 0 && <Text dimColor>Nothing. Claude can keep going.</Text>}
-       {needs.map(b => (
-         <Box key={b.id} flexDirection="column" marginTop={1}>
-           <Text wrap="wrap">
-             <Text color="warning" bold>{kindLabel(b.kind)}</Text>
-             {b.agent ? <Text dimColor> ({b.agent})</Text> : null}
-             <Text> {b.what}</Text>
-             <Text dimColor> · {elapsed(at - b.since)}</Text>
-           </Text>
-           {b.command ? <Text color="suggestion" wrap="wrap">  ! {b.command}</Text> : null}
-           {!b.auto || b.command ? (
-             <Box flexDirection="row" gap={2}>
-               {b.command ? (
-                 <Button key={`copy-${b.id}`} label="Copy command" onPress={() => void $.ui.copy({ text: `! ${b.command}`, surface: e.surface })} />
-               ) : null}
-               {!b.auto ? (
-                 <Button key={`done-${b.id}`} label="Done" onPress={() => void dropBlocker($, x => x.id === b.id)} />
-               ) : null}
+       {needs.map(b => {
+         const lines = b.command.split('\n')
+         const first = lines[0] ?? ''
+         const more = lines.length > 1 ? ` (+${lines.length - 1} lines)` : ''
+         return (
+           <Box key={b.id} flexDirection="column" marginTop={1}>
+             <Box flexDirection="row" justifyContent="space-between">
+               <Text wrap="truncate-end">
+                 <Text color="warning" bold>{kindLabel(b.kind)}</Text>
+                 {b.agent ? <Text dimColor> · {b.agent}</Text> : null}
+               </Text>
+               <Text dimColor>{elapsed(at - b.since)} ago</Text>
              </Box>
-           ) : null}
-         </Box>
-       ))}
+             <Text wrap="wrap">{b.what}</Text>
+             {b.command ? (
+               <Text dimColor wrap="truncate-end">
+                 $ {first}
+                 {more}
+               </Text>
+             ) : null}
+             {!b.auto || b.command ? (
+               <Box flexDirection="row" gap={2}>
+                 {b.command ? (
+                   <Button key={`copy-${b.id}`} label="Copy" onPress={() => void $.ui.copy({ text: `! ${b.command}`, surface: e.surface })} />
+                 ) : null}
+                 {!b.auto ? (
+                   <Button key={`done-${b.id}`} label="Done" onPress={() => void dropBlocker($, x => x.id === b.id)} />
+                 ) : null}
+               </Box>
+             ) : null}
+           </Box>
+         )
+       })}
       </Box>
     )
   })
