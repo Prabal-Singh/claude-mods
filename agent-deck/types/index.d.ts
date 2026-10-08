@@ -27,6 +27,8 @@ export type AgentRow = {
 
 export type AgentMap = Record<string, AgentRow>
 
+export type Reservation = { name: string; at: number }
+
 export type Blocker = {
   id: string
   kind: string
@@ -39,6 +41,6 @@ export type Blocker = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'agent-deck': { agents: AgentMap; expanded: string | null; now: number; opened: boolean; blockers: Blocker[]; blockerSeq: number; usedNames: string[] }
+    'agent-deck': { agents: AgentMap; expanded: string | null; now: number; opened: boolean; blockers: Blocker[]; blockerSeq: number; reserved: Reservation[] }
   }
 }

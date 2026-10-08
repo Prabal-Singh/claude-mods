@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentMap, AgentRow, Blocker } from '../types'
+import type { AgentMap, AgentRow, Blocker, Reservation } from '../types'
 
 const PANE = 'agents'
 const TITLE = 'Agents'
@@ -25,7 +25,7 @@ export const NAMES = [
 const SPAWN_RULE =
   'Subagents may spawn their own subagents (Agent tool) for parts of their task that split cleanly. ' +
   'When you brief a subagent whose work may split, pick an agent type that has the Agent tool, and give each a precise brief. ' +
-  'Always give every subagent a name (the Agent tool\'s `name`): a Vox Machina character not already used in this session, ' +
+  'Always give every subagent a name (the Agent tool\'s `name`): a Vox Machina character no running subagent is using, ' +
   `in this order: ${NAMES.join(', ')} (past the list, add -2: grog-2). ` +
   'Refer to each subagent by that name when you talk about it or message it. ' +
   'When a subagent\'s context grows big (about 200k tokens, many rounds of fixes or rebases, or it gets slow), retire it: ' +
@@ -50,7 +50,9 @@ const expanded = atom({ plugin: 'agent-deck', key: 'expanded' } as const, null)
 const now = atom({ plugin: 'agent-deck', key: 'now' } as const, 0)
 const opened = atom({ plugin: 'agent-deck', key: 'opened' } as const, false)
 const blockers = atom({ plugin: 'agent-deck', key: 'blockers' } as const, [])
-const usedNames = atom({ plugin: 'agent-deck', key: 'usedNames' } as const, [])
+const reserved = atom({ plugin: 'agent-deck', key: 'reserved' } as const, [])
+// A name handed to an Agent call is held this long, until its spawn is recorded.
+const RESERVE_MS = 2 * 60 * 1000
 const blockerSeq = atom({ plugin: 'agent-deck', key: 'blockerSeq' } as const, 0)
 
 // Estimated list prices, USD per million tokens [input, output]; cache reads 0.1x input, cache writes 1.25x.
@@ -85,6 +87,12 @@ export function nameFor(taken: readonly string[]): string {
       if (!taken.includes(name)) return name
     }
   }
+}
+
+export function namesInUse(map: AgentMap, held: readonly Reservation[]): string[] {
+  const live = Object.values(map).filter(r => isLive(r) && r.name).map(r => r.name)
+  const recorded = new Set(Object.values(map).map(r => r.name))
+  return [...live, ...held.filter(r => !recorded.has(r.name) || live.includes(r.name)).map(r => r.name)]
 }
 
 const WRITES = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit'])
@@ -485,13 +493,16 @@ export const register: Register = on => {
     let call = e
     const input = e as unknown as Record<string, unknown>
     if (e.tool === 'Agent') {
-      // Reserve the name now: parallel Agent calls in one message all reach here before any spawn is recorded.
+      // Names are held only by running agents, plus names just handed to Agent calls whose spawn is not recorded yet
+      // (parallel calls in one message all reach here first). A finished agent's name is free again.
       const given = typeof input.name === 'string' ? input.name.trim() : ''
+      const at = await $.clock.now()
       let name = given
-      await update($, usedNames, used => {
-        const taken = [...used, ...Object.values(map0).map(r => r.name)]
+      await update($, reserved, list => {
+        const fresh = list.filter(r => at - r.at < RESERVE_MS)
+        const taken = namesInUse(map0, fresh)
         if (!name || taken.includes(name)) name = nameFor(taken)
-        return [...used, name]
+        return [...fresh, { name, at }]
       })
       if (name !== given) call = { ...e, name } as typeof e
     }

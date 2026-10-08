@@ -31,7 +31,8 @@ the open items (unseen), so when your message settles one ("go with B", pasted o
 replace the previous reply's, commands read from replies expire after 2 hours, and flagged items after 24 hours.
 
 **Names.** Every subagent gets a name, so you can refer to it and message it: Vox Machina, in order. `kiki`, `vex`,
-`vax`, `grog`, `pike`, `scanlan`, `percy`… (then `kiki-2`). Two agents never share a name, even when they start in
+`vax`, `grog`, `pike`, `scanlan`, `percy`…, the first one no running agent holds (a finished agent frees its name;
+`-2` only when all are busy). Two running agents never share a name, even when they start in
 the same message.
 
 **Subagents may spawn subagents.** Every subagent prompt says so, and agents are told to hand off parts that split

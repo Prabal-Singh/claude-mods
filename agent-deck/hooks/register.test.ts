@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-import { NAMES, actionLabel, adoptRows, commandKey, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
+import { NAMES, actionLabel, adoptRows, commandKey, namesInUse, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
 import type { AgentRow } from '../types'
 
 const base = (id: string, over: Partial<AgentRow> = {}): AgentRow => ({
@@ -26,6 +26,7 @@ test('names: the first free Vox Machina character, then -2', () => {
 })
 
 test('names: unnamed calls get the next free character, parallel calls never share one, a taken name is replaced', async ($, on) => {
+  mock.clock(on, { now: 1000 })
   const seen: unknown[] = []
   on('tool.call', ($, e) => {
     seen.push((e as unknown as Record<string, unknown>).name)
@@ -227,4 +228,15 @@ test('a long finished row is cut to the panel width, never squeezed to nothing; 
   const row = await ui.find({ key: 'row-c1' })
   expect(String(row?.props.label ?? '')).toContain('cassandra')
   expect(String(row?.props.label ?? '').length).toBeLessThanOrEqual(38)
+})
+
+test('a finished agent frees its name; running agents and fresh reservations hold theirs', () => {
+  const map = {
+    a: base('a', { name: 'kiki', status: 'completed' }),
+    b: base('b', { name: 'vex' }),
+  }
+  expect(namesInUse(map, [])).toEqual(['vex'])
+  expect(nameFor(namesInUse(map, []))).toBe('kiki')
+  expect(namesInUse(map, [{ name: 'vax', at: 0 }])).toEqual(['vex', 'vax'])
+  expect(namesInUse(map, [{ name: 'kiki', at: 0 }])).toEqual(['vex'])
 })
