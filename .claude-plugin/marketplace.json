@@ -1,0 +1,19 @@
+{
+  "name": "prabal-mods",
+  "owner": {
+    "name": "Prabal Singh",
+    "url": "https://github.com/Prabal-Singh"
+  },
+  "plugins": [
+    {
+      "name": "cache-clock",
+      "source": "./cache-clock",
+      "description": "Compacts the session just before the prompt cache expires"
+    },
+    {
+      "name": "agent-deck",
+      "source": "./agent-deck",
+      "description": "Subagents as a live tree in a pane on the right; subagents may spawn their own"
+    }
+  ]
+}

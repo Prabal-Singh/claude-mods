@@ -1,0 +1,11 @@
+{
+  "name": "cache-clock",
+  "version": "0.2.0",
+  "description": "Compacts the session just before the prompt cache expires, and says so in the transcript",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Prabal Singh",
+    "url": "https://github.com/Prabal-Singh"
+  },
+  "license": "MIT"
+}

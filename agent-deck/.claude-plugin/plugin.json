@@ -1,0 +1,11 @@
+{
+  "name": "agent-deck",
+  "version": "0.2.0",
+  "description": "A pane on the right that tracks this session's subagents as a tree: status, current action, files changed, tokens and cost",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Prabal Singh",
+    "url": "https://github.com/Prabal-Singh"
+  },
+  "license": "MIT"
+}
