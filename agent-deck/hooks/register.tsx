@@ -25,9 +25,10 @@ export const NAMES = [
 const SPAWN_RULE =
   'Subagents may spawn their own subagents (Agent tool) for parts of their task that split cleanly. ' +
   'When you brief a subagent whose work may split, pick an agent type that has the Agent tool, and give each a precise brief. ' +
-  'Always give every subagent a name (the Agent tool\'s `name`): a Vox Machina character no running subagent is using, ' +
-  `in this order: ${NAMES.join(', ')} (past the list, add -2: grog-2). ` +
-  'Refer to each subagent by that name when you talk about it or message it. ' +
+  'Always give every subagent a name (the Agent tool\'s `name`): the first Vox Machina character no agent has had in this ' +
+  `session (finished agents keep theirs), in this order: ${NAMES.join(', ')} (past the list, add -2: grog-2). ` +
+  'Put the name in `name`, not only in the prompt. If the name was taken, the Agent result says which name the agent got: ' +
+  'use that one. Refer to each subagent by its name when you talk about it or message it. ' +
   'When a subagent\'s context grows big (about 200k tokens, many rounds of fixes or rebases, or it gets slow), retire it: ' +
   'make sure its committed work is pushed, note its uncommitted changes, stop it, and hand a fresh agent in the same ' +
   'worktree a tight brief plus that leftover work (the /retire command spells out the steps).'
@@ -89,10 +90,49 @@ export function nameFor(taken: readonly string[]): string {
   }
 }
 
-export function namesInUse(map: AgentMap, held: readonly Reservation[]): string[] {
-  const live = Object.values(map).filter(r => isLive(r) && r.name).map(r => r.name)
-  const recorded = new Set(Object.values(map).map(r => r.name))
-  return [...live, ...held.filter(r => !recorded.has(r.name) || live.includes(r.name)).map(r => r.name)]
+// Every name an agent has had this session, running or finished: a name is never handed out twice, so SendMessage and
+// the reports always mean one agent. Rows that left the panel are still in the engine's list.
+export function namesInUse(map: AgentMap, held: readonly Reservation[], listed: readonly { name?: string }[] = []): string[] {
+  const all = [...Object.values(map).map(r => r.name), ...listed.map(a => a.name ?? ''), ...held.map(r => r.name)]
+  return [...new Set(all.filter(Boolean))]
+}
+
+const NAME_RE = new RegExp(`^\\s*You are (${NAMES.join('|')})(-\\d+)?\\b`, 'i')
+
+// A name a brief gives itself in its first words ("You are tary-3. ..."), for calls that leave out `name`.
+export function claimedName(prompt: string): string {
+  const m = NAME_RE.exec(prompt)
+  return m ? `${m[1]!.toLowerCase()}${m[2] ?? ''}` : ''
+}
+
+// The prompt with its "You are X" opening naming the agent's real name, and a line saying it.
+export function namedPrompt(prompt: string, name: string): string {
+  const fixed = claimedName(prompt) && claimedName(prompt) !== name ? prompt.replace(NAME_RE, m => m.replace(/You are \S+/i, `You are ${name}`)) : prompt
+  const line = `Your name in this session is ${name}.`
+  return fixed.includes(line) ? fixed : `${fixed}\n\n${line}`
+}
+
+// Agents for /agent and its autocomplete: running first, then newest; the panel's rows plus the engine's list.
+export function agentsByName(map: AgentMap, listed: readonly AgentInfoLike[]): { id: string; name: string; description: string; status: string }[] {
+  const rows = new Map<string, { id: string; name: string; description: string; status: string; at: number }>()
+  listed.forEach((a, i) => a.name && rows.set(a.id, { id: a.id, name: a.name, description: a.description, status: a.status, at: -1 - i }))
+  for (const r of Object.values(map)) if (r.name) rows.set(r.id, { id: r.id, name: r.name, description: r.description, status: r.status, at: r.startedAt })
+  const live = (s: string) => Number(['running', 'pending', 'waiting'].includes(s))
+  return [...rows.values()].sort((a, b) => live(b.status) - live(a.status) || b.at - a.at)
+}
+
+// Autocomplete rows for the name after /agent or /tell: the token being typed is the command's first argument.
+export function agentSuggestions(text: string, start: number | undefined, token: string, agents: ReturnType<typeof agentsByName>) {
+  if (start === undefined || !/^\s*\/(?:agent|tell|retire)\s+$/.test(text.slice(0, start))) return []
+  const seen = new Set<string>()
+  return agents
+    .filter(a => a.name.toLowerCase().startsWith(token.toLowerCase()) && !seen.has(a.name) && seen.add(a.name))
+    .slice(0, 12)
+    .map(a => ({ text: `${a.name} `, label: a.name, description: `${STATUS_WORD[a.status] ?? a.status} · ${short(a.description, 50)}` }))
+}
+
+const STATUS_WORD: Record<string, string> = {
+  running: 'running', pending: 'starting', waiting: 'waiting', idle: 'done', completed: 'done', failed: 'failed', killed: 'stopped',
 }
 
 const WRITES = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit'])
@@ -396,6 +436,11 @@ export const register: Register = on => {
       }
     }
     await step('command deck', () => $.command.register({ name: 'deck', description: 'Show or hide the Agents panel (subagents and what is blocked on you)' }))
+    await step('command agent', () => $.command.register({
+      name: 'agent',
+      description: 'Jump to a subagent by name in the Agents panel (/tell <name> <message> to message it)',
+      argumentHint: '<name>',
+    }))
     await step('tool blocked_on_user', () => $.tool.register({
       name: BLOCK_TOOL,
       description:
@@ -459,6 +504,38 @@ export const register: Register = on => {
     return { text: 'Agents pane opened.' }
   }).catch(() => ({ text: 'Agents pane: could not toggle.' }))
 
+  on('command.run', { command: 'agent' }, async ($, e) => {
+    let listed: AgentInfoLike[] = []
+    try {
+      listed = await $.agent.list()
+    } catch {}
+    const map = await read($, agents)
+    const all = agentsByName(map, listed)
+    const [want = ''] = e.args.trim().split(/\s+/)
+    const roster = () => all.map(a => `${a.name} (${STATUS_WORD[a.status] ?? a.status}): ${short(a.description, 50)}`).join('\n')
+    if (!want) return { text: all.length ? `Subagents this session:\n${roster()}\nType /agent <name>.` : 'No subagents yet.' }
+    const hit = all.find(a => a.name.toLowerCase() === want.toLowerCase())
+    if (!hit) return { text: `No subagent named ${want}.${all.length ? `\n${roster()}` : ''}` }
+    if (!map[hit.id]) {
+      const info = listed.find(a => a.id === hit.id)
+      const at = await $.clock.now()
+      if (info) await update($, agents, cur => ({ ...cur, [hit.id]: newRow({ id: info.id, name: info.name ?? '', description: info.description, type: info.type, parentId: info.parentId ?? null, status: info.status, endedAt: at, current: '', alerted: true, joinedLate: true }, at) }))
+    }
+    await update($, expanded, () => hit.id)
+    await openPane($)
+    return { text: `${hit.name} (${STATUS_WORD[hit.status] ?? hit.status}): ${short(hit.description, 60)}. Opened in the Agents panel. Message it: /tell ${hit.name} <message>. Full transcript: /tasks, pick it, Enter.` }
+  }).catch(() => ({ text: '/agent: could not open that agent.' }))
+
+  on('prompt.autocomplete', async ($, e, next) => {
+    const result = await next(e)
+    let listed: AgentInfoLike[] = []
+    try {
+      listed = await $.agent.list()
+    } catch {}
+    const mine = agentSuggestions(e.text.slice(0, e.cursor ?? e.text.length), e.start, e.token ?? '', agentsByName(await read($, agents), listed))
+    return mine.length ? { ...result, suggestions: [...mine, ...result.suggestions] } : result
+  }).catch(($, e, next) => next(e))
+
   on('agent.spawn', async ($, e, next) => {
     const prompt = e.prompt.includes(MAY_SPAWN.trim()) ? e.prompt : e.prompt + MAY_SPAWN
     const result = await next({ ...e, prompt })
@@ -503,19 +580,33 @@ export const register: Register = on => {
     const map0 = await read($, agents)
     let call = e
     const input = e as unknown as Record<string, unknown>
+    let renamed = ''
     if (e.tool === 'Agent') {
-      // Names are held only by running agents, plus names just handed to Agent calls whose spawn is not recorded yet
-      // (parallel calls in one message all reach here first). A finished agent's name is free again.
+      // A name is never handed out twice in a session: names of running and finished agents, plus names just handed to
+      // Agent calls whose spawn is not recorded yet (parallel calls in one message all reach here first). A call with
+      // no `name` takes the one its prompt gives itself ("You are tary-3"), if free. The agent's prompt always carries
+      // the name it got, so the agent, the panel, its report and SendMessage agree.
       const given = typeof input.name === 'string' ? input.name.trim() : ''
+      const prompt = typeof input.prompt === 'string' ? input.prompt : ''
+      const wanted = given || claimedName(prompt)
+      let listed: AgentInfoLike[] = []
+      try {
+        listed = await $.agent.list()
+      } catch {}
       const at = await $.clock.now()
-      let name = given
+      let name = wanted
       await update($, reserved, list => {
         const fresh = list.filter(r => at - r.at < RESERVE_MS)
-        const taken = namesInUse(map0, fresh)
+        const taken = namesInUse(map0, fresh, listed)
         if (!name || taken.includes(name)) name = nameFor(taken)
         return [...fresh, { name, at }]
       })
-      if (name !== given) call = { ...e, name } as typeof e
+      call = { ...e, name, ...(prompt ? { prompt: namedPrompt(prompt, name) } : {}) } as typeof e
+      if (name !== given) {
+        const why = name === wanted ? 'taken from its prompt; put it in `name` next time' : wanted ? `not ${wanted}: that name was already used in this session` : 'the call gave no name'
+        renamed = `This subagent is named ${name} (${why}). Call it ${name} and message it as ${name}.`
+        if (wanted && name !== wanted) $.ui.toast(`Agent named ${name} (${wanted} was taken)`)
+      }
     }
     const id = e.agentId
     if (id && (await read($, agents))[id]) {
@@ -546,7 +637,10 @@ export const register: Register = on => {
       }
     }
     try {
-      return await next(call)
+      const res = await next(call)
+      if (!renamed || (res as { deny?: unknown }).deny !== undefined) return res
+      const ctx = (res as { context?: unknown }).context
+      return { ...res, context: [...(Array.isArray(ctx) ? ctx : typeof ctx === 'string' ? [ctx] : []), renamed] } as typeof res
     } finally {
       // The call ran (or was refused): a permission prompt for this tool is over.
       await dropBlocker($, b => b.kind === 'permission' && b.id === `perm-${e.tool}${who ? `-${who}` : ''}`)

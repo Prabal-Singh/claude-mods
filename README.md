@@ -32,9 +32,15 @@ the open items (unseen), so when your message settles one ("go with B", pasted o
 replace the previous reply's, commands read from replies expire after 2 hours, and flagged items after 24 hours.
 
 **Names.** Every subagent gets a name, so you can refer to it and message it: Vox Machina, in order. `kiki`, `vex`,
-`vax`, `grog`, `pike`, `scanlan`, `percy`…, the first one no running agent holds (a finished agent frees its name;
-`-2` only when all are busy). Two running agents never share a name, even when they start in
-the same message.
+`vax`, `grog`, `pike`, `scanlan`, `percy`…, the first one no agent has had in this session (finished agents keep theirs,
+so `SendMessage` and the reports always mean one agent; `-2` once the list is used up). A call with no name takes the
+one its brief gives itself ("You are tary-3"); a name already used is replaced, and the Agent result tells Claude the
+name the agent got. The agent's prompt always says its name, so the agent, the panel and its report agree.
+
+**`/agent <name>`** jumps to a subagent: it opens the panel with that agent's row expanded (task, status, files, last
+actions, result). With no name it lists them. **`/tell <name> <message>`** has Claude send it a message. Both
+autocomplete the name as you type it (running agents first); so does `/retire`. The full transcript is Claude Code's
+own view: `/tasks`, pick the agent, Enter.
 
 **Subagents may spawn subagents.** Every subagent prompt says so, and agents are told to hand off parts that split
 cleanly.

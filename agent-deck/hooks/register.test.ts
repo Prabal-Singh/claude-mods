@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-import { NAMES, actionLabel, adoptRows, commandKey, namesInUse, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
+import { NAMES, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, namesInUse, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
 import type { AgentRow } from '../types'
 
 const base = (id: string, over: Partial<AgentRow> = {}): AgentRow => ({
@@ -230,15 +230,72 @@ test('a long finished row is cut to the panel width, never squeezed to nothing; 
   expect(String(row?.props.label ?? '').length).toBeLessThanOrEqual(38)
 })
 
-test('a finished agent frees its name; running agents and fresh reservations hold theirs', () => {
+test('a name is never handed out twice in a session: finished agents and the engine\'s list keep theirs', () => {
   const map = {
     a: base('a', { name: 'kiki', status: 'completed' }),
     b: base('b', { name: 'vex' }),
   }
-  expect(namesInUse(map, [])).toEqual(['vex'])
-  expect(nameFor(namesInUse(map, []))).toBe('kiki')
-  expect(namesInUse(map, [{ name: 'vax', at: 0 }])).toEqual(['vex', 'vax'])
-  expect(namesInUse(map, [{ name: 'kiki', at: 0 }])).toEqual(['vex'])
+  expect(namesInUse(map, [])).toEqual(['kiki', 'vex'])
+  expect(nameFor(namesInUse(map, []))).toBe('vax')
+  expect(namesInUse(map, [{ name: 'vax', at: 0 }], [{ name: 'grog' }, {}])).toEqual(['kiki', 'vex', 'grog', 'vax'])
+})
+
+test('a brief that names itself: the name is read from it, and the prompt always says the name the agent got', () => {
+  expect(claimedName('You are tary-3. The public sdk repo ...')).toBe('tary-3')
+  expect(claimedName('  You are Grog, a reviewer')).toBe('grog')
+  expect(claimedName('You are a reviewer')).toBe('')
+  expect(namedPrompt('You are tary-3. Rebase it.', 'kiki')).toBe('You are kiki. Rebase it.\n\nYour name in this session is kiki.')
+  expect(namedPrompt('Rebase it.', 'vex')).toBe('Rebase it.\n\nYour name in this session is vex.')
+  expect(namedPrompt(namedPrompt('Rebase it.', 'vex'), 'vex')).toBe('Rebase it.\n\nYour name in this session is vex.')
+})
+
+test('an Agent call: the prompt\'s own name is used when free, a taken name is replaced and the result says so', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  const seen: Record<string, unknown>[] = []
+  on('tool.call', ($, e) => {
+    seen.push(e as unknown as Record<string, unknown>)
+    return { result: 'launched' }
+  })
+  const first = await $.tool.call({ tool: 'Agent', description: 'Rebase', prompt: 'You are tary-3. Rebase the sdk.' } as never)
+  expect(seen[0]!.name).toBe('tary-3')
+  expect(String(seen[0]!.prompt)).toContain('Your name in this session is tary-3.')
+  expect(JSON.stringify(first)).toContain('taken from its prompt')
+  const second = await $.tool.call({ tool: 'Agent', description: 'Again', prompt: 'You are tary-3. Again.', name: 'tary-3' } as never)
+  expect(seen[1]!.name).toBe('kiki')
+  expect(String(seen[1]!.prompt)).toMatch(/^You are kiki\. Again\./)
+  expect(JSON.stringify(second)).toContain('named kiki (not tary-3')
+  const third = await $.tool.call({ tool: 'Agent', description: 'Fresh', prompt: 'Do it', name: 'vex' } as never)
+  expect(seen[2]!.name).toBe('vex')
+  expect(JSON.stringify(third)).not.toContain('already used')
+})
+
+test('/agent: names autocomplete after the command, running first; a name opens its row', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  let n = 0
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: `g${++n}` }))
+  on('prompt.autocomplete', () => ({ suggestions: [{ text: 'built-in' }] }))
+  await $.agent.spawn({ prompt: 'x', description: 'Review PR 5', name: 'kiki' } as never)
+  await clock.advance(1000)
+  await $.agent.spawn({ prompt: 'x', description: 'Fix the poller', name: 'kima' } as never)
+  const all = agentsByName(await (async () => ({ g1: base('g1', { name: 'kiki', status: 'completed', startedAt: 1 }), g2: base('g2', { name: 'kima', startedAt: 2 }) }))(), [])
+  expect(all.map(a => a.name)).toEqual(['kima', 'kiki'])
+  expect(agentSuggestions('/agent k', 7, 'k', all).map(s => s.label)).toEqual(['kima', 'kiki'])
+  expect(agentSuggestions('/agent kik', 7, 'kik', all).map(s => s.text)).toEqual(['kiki '])
+  expect(agentSuggestions('hello k', 6, 'k', all)).toEqual([])
+  expect(agentSuggestions('/tell k', 6, 'k', all).map(s => s.label)).toEqual(['kima', 'kiki'])
+  expect(agentSuggestions('/agent kiki do', 12, 'do', all)).toEqual([])
+  const done = await $.command.run({ command: 'agent', args: 'kiki' } as never)
+  expect(JSON.stringify(done)).toContain('kiki')
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck', surface: 'terminal', component: 'Pane', requestId: 'agents',
+    props: { title: 'Agents', isFocused: true, bodyColumns: 56, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  })
+  expect(await ui.find({ type: 'Text', text: /Task: x/ })).toBeDefined()
+  const rows = await $.prompt.autocomplete({ text: '/agent k', cursor: 8, token: 'k', start: 7 } as never)
+  expect(JSON.stringify(rows)).toContain('kima')
+  const missing = await $.command.run({ command: 'agent', args: 'nobody' } as never)
+  expect(JSON.stringify(missing)).toContain('No subagent named nobody')
 })
 
 test('an inline `! cmd`: description ends at the backtick and is labelled by its description', () => {
