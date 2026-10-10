@@ -14,6 +14,11 @@
       "name": "agent-deck",
       "source": "./agent-deck",
       "description": "Subagents as a live tree in a pane on the right; subagents may spawn their own"
+    },
+    {
+      "name": "status-report",
+      "source": "./status-report",
+      "description": "/report writes a dated HTML status report: done, in progress, blocked, decisions, subagents and spend"
     }
   ]
 }

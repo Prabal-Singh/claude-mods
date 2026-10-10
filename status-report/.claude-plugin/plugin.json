@@ -1,0 +1,11 @@
+{
+  "name": "status-report",
+  "version": "0.1.0",
+  "description": "/report writes a dated HTML status report of the session: done, in progress, blocked, decisions, subagents and spend",
+  "dependencies": ["agent-deck"],
+  "author": {
+    "name": "Prabal Singh",
+    "url": "https://github.com/Prabal-Singh"
+  },
+  "license": "MIT"
+}

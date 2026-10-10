@@ -1,6 +1,6 @@
 # claude-mods
 
-Two mods for [Claude Code](https://claude.com/claude-code).
+Three mods for [Claude Code](https://claude.com/claude-code).
 
 ## agent-deck: your subagents, live, in a panel on the right
 
@@ -58,6 +58,21 @@ Claude Code's prompt cache lasts an hour after the last reply. After that, your 
 context at full price. cache-clock compacts the session 3 minutes before the cache expires, while compacting is
 still cheap, and says so in the transcript. It compacts once per reply, so an idle session isn't summarised over and
 over. It assumes the one-hour cache, not the five-minute one.
+
+## status-report: a status report you can send
+
+```
+/plugin install status-report --marketplace Prabal-Singh/claude-mods
+```
+
+`/report` writes a dated HTML page of where the session stands, then opens it: in one line, done (with proof: PR,
+deploy, file), in progress, blocked on you, decisions made and open, subagents and spend, next. It goes to
+`~/Desktop/flow-notes/status/<date>.html` (`-2`, `-3` on the same day; a report is never overwritten). Add who it is for
+or what to cover: `/report for Samyak`, `/report HealthifyMe only`. For a reader outside the team it leaves out
+customer and vendor names unless you ask.
+
+The mod hands Claude what it cannot see in the conversation: the session's cost so far, and from agent-deck (installed
+with it) every subagent's status, time, cost and files, plus the open "Blocked on you" items.
 
 ## License
 
