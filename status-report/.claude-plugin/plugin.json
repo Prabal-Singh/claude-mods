@@ -1,6 +1,6 @@
 {
   "name": "status-report",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "/report writes a dated HTML status report of the session: done, in progress, blocked, decisions, subagents and spend",
   "dependencies": ["agent-deck"],
   "author": {

@@ -1,4 +1,4 @@
-import { test, expect } from 'claude-code/testing'
+import { test, expect, mock } from 'claude-code/testing'
 
 import { factsNote, isReport, minutes } from './register'
 
@@ -41,4 +41,13 @@ test('an empty session says so plainly', () => {
   expect(note).toContain('Session cost: not recorded.')
   expect(note).toContain('Subagents: none this session.')
   expect(note).toContain('nothing open in the panel')
+})
+
+test('/report gets the facts appended to its prompt', async ($, on) => {
+  mock.clock(on, { now: 0 })
+  on('skill.prompt', () => ({ text: 'Write a status report.' }))
+  const out = await $.skill.prompt({ skill: 'status-report:report', text: 'Write a status report.' } as never)
+  expect(out.text).toContain('Write a status report.\n\nFacts for the status report')
+  const other = await $.skill.prompt({ skill: 'commit', text: 'x' } as never)
+  expect(other.text).toBe('Write a status report.')
 })

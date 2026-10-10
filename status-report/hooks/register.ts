@@ -29,8 +29,8 @@ export type Facts = {
   blockers: BlockerFact[]
 }
 
-// The command as the engine names it: `report`, or `status-report:report` when namespaced.
-export const isReport = (command: string): boolean => command === 'report' || command.endsWith(':report')
+// The skill as the engine names it: `report`, or `status-report:report` when namespaced.
+export const isReport = (skill: string): boolean => skill === 'report' || skill.endsWith(':report')
 
 export const minutes = (ms: number): string => {
   const m = Math.max(0, Math.round(ms / 60_000))
@@ -45,7 +45,7 @@ const firstLine = (s: string, max = 160): string => {
 }
 
 export function factsNote(f: Facts): string {
-  const lines = ['Facts for the status report, from the status-report mod (use them; do not quote this note):']
+  const lines = ['Facts for the status report, from the status-report mod (use them; do not quote this list):']
   lines.push(`- Session: ${f.cwd}, model ${f.model}, ${f.turns} prompts so far` +
     (f.startedAt !== undefined ? `, started ${minutes(f.now - f.startedAt)} ago` : '') + '.')
   lines.push(f.costUsd === undefined ? '- Session cost: not recorded.' : `- Session cost so far: ${usd(f.costUsd)} (subagents included).`)
@@ -70,16 +70,17 @@ export function factsNote(f: Facts): string {
   return lines.join('\n')
 }
 
+// A plugin's slash command is expanded as a skill: `skill.prompt` fires (typed or via the Skill tool), not `command.run`.
 export const register: Register = (on) => {
-  on('command.run', async ($, e, next) => {
-    if (!isReport(e.command)) return next(e)
+  on('skill.prompt', async ($, e, next) => {
+    if (!isReport(e.skill)) return next(e)
     const answer = await next(e)
     const [usage, model, turns, cwd, now, agents, blockers] = await Promise.all([
       $.session.usage().catch(() => undefined),
-      $.session.model(),
-      $.session.turns(),
-      $.session.cwd(),
-      $.clock.now(),
+      $.session.model().catch(() => 'unknown'),
+      $.session.turns().catch(() => 0),
+      $.session.cwd().catch(() => 'unknown'),
+      $.clock.now().catch(() => Date.now()),
       $.state.get(agentsRef).then(r => r.value ?? {}).catch(() => ({})),
       $.state.get(blockersRef).then(r => r.value ?? []).catch(() => []),
     ])
@@ -93,6 +94,6 @@ export const register: Register = (on) => {
       agents: Object.values(agents),
       blockers,
     })
-    return { ...answer, context: [...(answer.context ?? []), note] }
+    return { text: `${answer.text}\n\n${note}` }
   }).catch(($, e, next) => next(e))
 }

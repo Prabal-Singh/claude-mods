@@ -5,7 +5,7 @@ argument-hint: "[who it is for, or what to cover, e.g. \"for Samyak\", \"since t
 
 Write a status report of this session as one HTML page. Who it is for or what to cover: $ARGUMENTS
 
-Use what you know from this conversation and the facts note the status-report mod adds after this message (session
+Use what you know from this conversation and the facts the status-report mod lists at the end of this message (session
 cost, subagents, open blockers). Check anything you are unsure of (git log, PR state, files) before you state it;
 never guess.
 
