@@ -40,6 +40,10 @@ export type Thread = {
   archived: { done: number; failed: number; cost: number }
 }
 
+// Every name this session handed out, by agent id, kept in $.store per session id so a restart or resume still knows
+// them: a SendMessage by name goes to the newest agent with it, and names rotate by when they were last free.
+export type NameEntry = { name: string; startedAt: number; endedAt: number | null }
+
 export type Reservation = { name: string; at: number }
 
 export type Blocker = {
@@ -54,6 +58,6 @@ export type Blocker = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'agent-deck': { agents: AgentMap; expanded: string | null; now: number; opened: boolean; blockers: Blocker[]; blockerSeq: number; reserved: Reservation[]; threads: Thread[]; currentThread: string; threadOpen: Record<string, boolean> }
+    'agent-deck': { agents: AgentMap; expanded: string | null; now: number; opened: boolean; blockers: Blocker[]; blockerSeq: number; reserved: Reservation[]; threads: Thread[]; currentThread: string; threadOpen: Record<string, boolean>; registry: Record<string, NameEntry> }
   }
 }

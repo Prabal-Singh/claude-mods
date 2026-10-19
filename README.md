@@ -32,10 +32,13 @@ the open items (unseen), so when your message settles one ("go with B", pasted o
 replace the previous reply's, commands read from replies expire after 2 hours, and flagged items after 24 hours.
 
 **Names.** Every subagent gets a name, so you can refer to it and message it: Vox Machina, in order. `kiki`, `vex`,
-`vax`, `grog`, `pike`, `scanlan`, `percy`…, the first one not held by a running agent or one that finished in the
-last 10 minutes (so the list starts over at `kiki` instead of climbing to `kiki-8`; `-2` once all are held). A call with no name takes the
-one its brief gives itself ("You are tary-3"); a name already used is replaced, and the Agent result tells Claude the
-name the agent got. The agent's prompt always says its name, so the agent, the panel and its report agree.
+`vax`, `grog`, `pike`, `scanlan`, `percy`…; all 20 are used before any comes back, then the one whose agent finished
+longest ago (never one running or finished under 10 minutes ago; `-2` only when all 20 are). The deck hands names out,
+not Claude: each message you send carries the next free names (unseen), a taken or missing name is replaced, every
+mention of the wanted name in the brief and description is swapped for the one the agent got, and the Agent result
+tells Claude. A `SendMessage` to a name goes to the newest agent with it, by id, so a reused name is never ambiguous.
+The names given are kept per session in the mod's store, so a restart or `--resume` keeps rotating instead of starting
+over (which is what made sends by name fail before).
 
 **`/agent <name>`** jumps to a subagent: it opens the panel with that agent's row expanded (task, status, files, last
 actions, result). With no name it lists them. **`/tell <name> <message>`** has Claude send it a message. Both

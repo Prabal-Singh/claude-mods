@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-import { NAMES, autoTitle, findThread, threadOrder, threadsNote, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, namesInUse, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
+import { NAMES, autoTitle, findThread, threadOrder, threadsNote, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, heldNames, pickName, nextNames, newestId, renameIn, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, treeLines } from './register'
 import type { AgentRow } from '../types'
 
 const base = (id: string, over: Partial<AgentRow> = {}): AgentRow => ({
@@ -20,9 +20,9 @@ test('labels: what an agent is doing, in a few words', () => {
 })
 
 test('names: the first free Vox Machina character, then -2', () => {
-  expect(nameFor([])).toBe('kiki')
-  expect(nameFor(['kiki', 'vex'])).toBe('vax')
-  expect(nameFor([...NAMES])).toBe('kiki-2')
+  expect(pickName(new Set(), {})).toBe('kiki')
+  expect(pickName(new Set(['kiki', 'vex']), {})).toBe('vax')
+  expect(pickName(new Set(NAMES), {})).toBe('kiki-2')
 })
 
 test('names: unnamed calls get the next free character, parallel calls never share one, a taken name is replaced', async ($, on) => {
@@ -238,17 +238,55 @@ test('a long finished row is cut to the panel width, never squeezed to nothing; 
   expect(String(row?.props.label ?? '').length).toBeLessThanOrEqual(38)
 })
 
-test('a name is never handed out twice in a session: finished agents and the engine\'s list keep theirs', () => {
-  const map = {
-    a: base('a', { name: 'kiki', status: 'completed' }),
-    b: base('b', { name: 'vex' }),
-  }
-  expect(namesInUse(map, [])).toEqual(['kiki', 'vex'])
-  expect(nameFor(namesInUse(map, []))).toBe('vax')
-  expect(namesInUse(map, [{ name: 'vax', at: 0 }], [{ name: 'grog' }, {}])).toEqual(['kiki', 'vex', 'grog', 'vax'])
-  // A finished agent that left the panel frees its name; one the engine still runs keeps it.
-  expect(namesInUse({}, [], [{ name: 'kiki', status: 'completed' }, { name: 'vex', status: 'running' }])).toEqual(['vex'])
-  expect(nameFor(namesInUse({}, [], [{ name: 'kiki', status: 'killed' }]))).toBe('kiki')
+test('names rotate: every character is used before one comes back, and the one free longest comes back first', () => {
+  const min = 60 * 1000
+  const used = (name: string, startedAt: number, endedAt: number | null) => ({ name, startedAt, endedAt })
+  // kiki and vex were used and are long done: the 18 never-used names still come first.
+  const names = { a: used('kiki', 0, 5 * min), b: used('vex', 0, 2 * min) }
+  expect(pickName(heldNames({}, [], [], names, 60 * min), names)).toBe('vax')
+  // All 20 used and free: the one whose agent finished longest ago.
+  const all = Object.fromEntries(NAMES.map((n, i) => [n, used(n, 0, (30 - i) * min)]))
+  expect(pickName(heldNames({}, [], [], all, 60 * min), all)).toBe('syldor')
+  expect(nextNames(heldNames({}, [], [], all, 60 * min), all, 3)).toEqual(['syldor', 'wilhand', 'jarett'])
+  // Held: running in the panel or the engine's list, just handed out, or ended under 10 minutes ago.
+  const held = heldNames(
+    { r: base('r', { name: 'kiki' }), d: base('d', { name: 'vex', status: 'completed', endedAt: 55 * min }) },
+    [{ name: 'vax', at: 0 }],
+    [{ name: 'grog', status: 'running' }, { name: 'pike', status: 'completed' }],
+    { x: used('scanlan', 0, 52 * min), y: used('percy', 0, 40 * min) },
+    60 * min,
+  )
+  expect([...held].sort()).toEqual(['grog', 'kiki', 'scanlan', 'vax', 'vex'])
+  // An agent known only from before a restart, never seen to end, holds its name 10 minutes from its start.
+  expect(heldNames({}, [], [], { z: used('tary', 55 * min, null) }, 60 * min).has('tary')).toBe(true)
+  expect(heldNames({}, [], [], { z: used('tary', 0, null) }, 60 * min).has('tary')).toBe(false)
+})
+
+test('SendMessage by name: the newest agent given it; mentions of a wanted name are swapped whole-word', () => {
+  const names = { a1: { name: 'kiki', startedAt: 1, endedAt: 2 }, a2: { name: 'kiki', startedAt: 9, endedAt: null }, a3: { name: 'vex', startedAt: 5, endedAt: null } }
+  expect(newestId(names, 'Kiki')).toBe('a2')
+  expect(newestId(names, 'grog')).toBeUndefined()
+  expect(renameIn('kiki: deploy. Report as kiki, not kikis or kiki-2.', 'kiki', 'vax')).toBe('vax: deploy. Report as vax, not kikis or kiki-2.')
+  expect(claimedName('Deploy it', 'kiki: deploy Vingo agent')).toBe('kiki')
+  expect(claimedName('Deploy it', 'Pike the agent')).toBe('')
+})
+
+test('a SendMessage to a name is sent to the newest agent with it, by id', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  let n = 0
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: `a${String(++n).padStart(16, '0')}` }))
+  const sent: unknown[] = []
+  on('tool.call', ($, e) => {
+    if (e.tool === 'SendMessage') sent.push((e as unknown as Record<string, unknown>).to)
+    return { result: 'ok' }
+  })
+  await $.agent.spawn({ prompt: 'x', description: 'one', name: 'kiki' } as never)
+  await $.agent.spawn({ prompt: 'x', description: 'two', name: 'kiki' } as never)
+  await $.tool.call({ tool: 'SendMessage', to: 'kiki', message: 'hi' } as never)
+  await $.tool.call({ tool: 'SendMessage', to: 'a0000000000000001', message: 'hi' } as never)
+  await $.tool.call({ tool: 'SendMessage', to: 'someone-else', message: 'hi' } as never)
+  expect(sent).toEqual(['a0000000000000002', 'a0000000000000001', 'someone-else'])
 })
 
 test('a brief that names itself: the name is read from it, and the prompt always says the name the agent got', () => {
@@ -270,7 +308,7 @@ test('an Agent call: the prompt\'s own name is used when free, a taken name is r
   const first = await $.tool.call({ tool: 'Agent', description: 'Rebase', prompt: 'You are tary-3. Rebase the sdk.' } as never)
   expect(seen[0]!.name).toBe('tary-3')
   expect(String(seen[0]!.prompt)).toContain('Your name in this session is tary-3.')
-  expect(JSON.stringify(first)).toContain('taken from its prompt')
+  expect(JSON.stringify(first)).toContain('taken from its brief')
   const second = await $.tool.call({ tool: 'Agent', description: 'Again', prompt: 'You are tary-3. Again.', name: 'tary-3' } as never)
   expect(seen[1]!.name).toBe('kiki')
   expect(String(seen[1]!.prompt)).toMatch(/^You are kiki\. Again\./)
@@ -337,8 +375,8 @@ test('finished rows stay in their thread an hour (newest few), but free their na
   }
   expect(Object.keys(pruneFinished(map, 61 * min, 60 * min, 1)).sort()).toEqual(['c'])
   expect(Object.keys(pruneFinished(map, 50 * min, 60 * min, 8)).sort()).toEqual(['a', 'b', 'c', 'd'])
-  expect(namesInUse(map, [], [], 50 * min)).toEqual([])
-  expect(namesInUse(map, [], [], 35 * min)).toEqual(['vex', 'vax'])
+  expect([...heldNames(map, [], [], {}, 50 * min)]).toEqual([])
+  expect([...heldNames(map, [], [], {}, 35 * min)]).toEqual(['vex', 'vax'])
 })
 
 test('agents join the current thread, their children their parent\'s; the pane shows one dropdown per thread', async ($, on) => {
@@ -357,4 +395,21 @@ test('agents join the current thread, their children their parent\'s; the pane s
   const heads = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.label ?? ''))
   expect(heads.some(l => l.startsWith('Fix e2e tests group A · 2 running'))).toBe(true)
   expect(heads.some(l => l.startsWith('Vingo agent · 1 running'))).toBe(true)
+})
+
+test('a taken name: the brief and description are rewritten to the name the agent got', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 'a0000000000000001' }))
+  const seen: Record<string, unknown>[] = []
+  on('tool.call', ($, e) => {
+    seen.push(e as unknown as Record<string, unknown>)
+    return { result: 'ok' }
+  })
+  await $.agent.spawn({ prompt: 'x', description: 'running one', name: 'kiki' } as never)
+  await $.tool.call({ tool: 'Agent', name: 'kiki', description: 'kiki: deploy Vingo', prompt: 'You are kiki. When done, report as kiki.' } as never)
+  const call = seen.at(-1)!
+  expect(call.name).toBe('vex')
+  expect(call.description).toBe('vex: deploy Vingo')
+  expect(call.prompt).toBe('You are vex. When done, report as vex.\n\nYour name in this session is vex.')
 })

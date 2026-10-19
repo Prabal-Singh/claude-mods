@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentMap, AgentRow, Blocker, Reservation, Thread } from '../types'
+import type { AgentMap, AgentRow, Blocker, NameEntry, Reservation, Thread } from '../types'
 
 const PANE = 'agents'
 const TITLE = 'Agents'
@@ -29,11 +29,12 @@ export const NAMES = [
 const SPAWN_RULE =
   'Subagents may spawn their own subagents (Agent tool) for parts of their task that split cleanly. ' +
   'When you brief a subagent whose work may split, pick an agent type that has the Agent tool, and give each a precise brief. ' +
-  'Always give every subagent a name (the Agent tool\'s `name`): the first Vox Machina character not used by a running ' +
-  `agent or one still in the Agents panel, in this order: ${NAMES.join(', ')} (past the list, add -2: grog-2). ` +
-  'A finished agent leaves the panel 10 minutes after it ends and its name is free again. ' +
-  'Put the name in `name`, not only in the prompt. If the name was taken, the Agent result says which name the agent got: ' +
-  'use that one. Refer to each subagent by its name when you talk about it or message it. ' +
+  'Always give every subagent a name in the Agent tool\'s `name`: the next free name from the list beside the user\'s ' +
+  `latest message ("Next free subagent names"), taken in order; names are Vox Machina characters (${NAMES.join(', ')}), ` +
+  'and all of them are used before any is used again. Do not write the name into the prompt or description: the agent is ' +
+  'told its name. If the name was taken, the Agent result says which name the agent got: use that one from then on. ' +
+  'Refer to each subagent by its name when you talk about it or message it; SendMessage to a name reaches the newest ' +
+  'agent with that name. ' +
   'When a subagent\'s context grows big (about 200k tokens, many rounds of fixes or rebases, or it gets slow), retire it: ' +
   'make sure its committed work is pushed, note its uncommitted changes, stop it, and hand a fresh agent in the same ' +
   'worktree a tight brief plus that leftover work (the /retire command spells out the steps).'
@@ -72,6 +73,10 @@ const blockers = atom({ plugin: 'agent-deck', key: 'blockers' } as const, [])
 const reserved = atom({ plugin: 'agent-deck', key: 'reserved' } as const, [])
 // A name handed to an Agent call is held this long, until its spawn is recorded.
 const RESERVE_MS = 2 * 60 * 1000
+const registry = atom({ plugin: 'agent-deck', key: 'registry' } as const, {})
+// Store entries for sessions untouched this long are dropped at session start; a session keeps its newest MAX_NAMES.
+const STORE_DAYS = 30
+const MAX_NAMES = 2000
 const blockerSeq = atom({ plugin: 'agent-deck', key: 'blockerSeq' } as const, 0)
 const threads = atom({ plugin: 'agent-deck', key: 'threads' } as const, [])
 const currentThread = atom({ plugin: 'agent-deck', key: 'currentThread' } as const, '')
@@ -102,37 +107,77 @@ function tail(path: string): string {
   return parts.length > 3 ? `…/${parts.slice(-3).join('/')}` : path
 }
 
-// The first character not already taken this session; past the list, grog-2, kiki-2, ...
-export function nameFor(taken: readonly string[]): string {
+// Names held now: running agents (the panel's rows and the engine's list), names just handed to Agent calls, and names
+// whose agent ended less than DONE_TTL_MS ago. An agent the registry knows from before a restart holds its name
+// DONE_TTL_MS from its start, unless it ended.
+export function heldNames(
+  map: AgentMap,
+  held: readonly Reservation[],
+  listed: readonly { name?: string; status?: string }[],
+  names: Record<string, NameEntry>,
+  at: number,
+): Set<string> {
+  const out = new Set<string>()
+  for (const r of Object.values(map)) if (r.name && (isLive(r) || at - (r.endedAt ?? r.lastActivity) <= DONE_TTL_MS)) out.add(r.name)
+  for (const a of listed) if (a.name && (!a.status || ['running', 'pending', 'waiting'].includes(a.status))) out.add(a.name)
+  for (const r of held) out.add(r.name)
+  for (const n of Object.values(names)) if (at - (n.endedAt ?? n.startedAt) <= DONE_TTL_MS) out.add(n.name)
+  return out
+}
+
+// When each name was last free: its newest agent's end (or start, when its end was never seen).
+function lastUsed(names: Record<string, NameEntry>): Map<string, number> {
+  const last = new Map<string, number>()
+  for (const n of Object.values(names)) last.set(n.name, Math.max(last.get(n.name) ?? 0, n.endedAt ?? n.startedAt))
+  return last
+}
+
+// The next name: one never used yet, in list order; else the free one whose agent finished longest ago, so every
+// character is used before any comes back. Only when all 20 are held: grog-2, kiki-2, ... by the same rule.
+export function pickName(held: ReadonlySet<string>, names: Record<string, NameEntry>): string {
+  const last = lastUsed(names)
   for (let round = 1; ; round++) {
-    for (const base of NAMES) {
-      const name = round === 1 ? base : `${base}-${round}`
-      if (!taken.includes(name)) return name
-    }
+    const free = NAMES.map(base => (round === 1 ? base : `${base}-${round}`)).filter(n => !held.has(n))
+    const never = free.find(n => !last.has(n))
+    if (never) return never
+    if (free.length) return [...free].sort((a, b) => (last.get(a) ?? 0) - (last.get(b) ?? 0))[0]!
   }
 }
 
-// Names held now: every agent in the panel (running, or finished less than DONE_TTL_MS ago), every agent the engine
-// lists as running, and names just handed to Agent calls. A name frees up once its agent has left the panel, so the
-// list starts again at kiki instead of climbing to kiki-7.
-export function namesInUse(
-  map: AgentMap,
-  held: readonly Reservation[],
-  listed: readonly { name?: string; status?: string }[] = [],
-  at?: number,
-): string[] {
-  const live = listed.filter(a => !a.status || ['running', 'pending', 'waiting'].includes(a.status))
-  // Rows stay in their thread for an hour, but hold their name only DONE_TTL_MS after they end.
-  const holding = Object.values(map).filter(r => at === undefined || isLive(r) || at - (r.endedAt ?? r.lastActivity) <= DONE_TTL_MS)
-  const all = [...holding.map(r => r.name), ...live.map(a => a.name ?? ''), ...held.map(r => r.name)]
-  return [...new Set(all.filter(Boolean))]
+// The next `k` names pickName would hand out, for the note beside each prompt.
+export function nextNames(held: ReadonlySet<string>, names: Record<string, NameEntry>, k: number): string[] {
+  const taken = new Set(held)
+  const out: string[] = []
+  for (let i = 0; i < k; i++) {
+    const n = pickName(taken, names)
+    out.push(n)
+    taken.add(n)
+  }
+  return out
+}
+
+// The newest agent a name was given to: where a SendMessage by that name goes.
+export function newestId(names: Record<string, NameEntry>, name: string): string | undefined {
+  const want = name.trim().toLowerCase()
+  let best: [string, number] | undefined
+  for (const [id, n] of Object.entries(names)) if (n.name.toLowerCase() === want && (!best || n.startedAt >= best[1])) best = [id, n.startedAt]
+  return best?.[0]
+}
+
+// Every whole-word mention of one name in a brief, swapped for another ("kiki" in "report as kiki", not in "kikis").
+export function renameIn(text: string, from: string, to: string): string {
+  if (!from || from === to) return text
+  const esc = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return text.replace(new RegExp(`(?<![\\w-])${esc}(?![\\w-])`, 'gi'), to)
 }
 
 const NAME_RE = new RegExp(`^\\s*You are (${NAMES.join('|')})(-\\d+)?\\b`, 'i')
+// A description that opens with a name: "kiki: deploy Vingo agent".
+const DESC_NAME_RE = new RegExp(`^\\s*(${NAMES.join('|')})(-\\d+)?\\s*[:—–-]\\s`, 'i')
 
 // A name a brief gives itself in its first words ("You are tary-3. ..."), for calls that leave out `name`.
-export function claimedName(prompt: string): string {
-  const m = NAME_RE.exec(prompt)
+export function claimedName(prompt: string, description = ''): string {
+  const m = NAME_RE.exec(prompt) ?? DESC_NAME_RE.exec(description)
   return m ? `${m[1]!.toLowerCase()}${m[2] ?? ''}` : ''
 }
 
@@ -434,6 +479,19 @@ export function ranCommand(text: string): string | null {
   return bang && bang[1] ? bang[1].trim() : null
 }
 
+// Beside each prompt, unseen by the user: the names the next Agent calls should use, so the brief, the panel and
+// SendMessage start out agreeing instead of being renamed after the call.
+async function namesNote($: EngineInterface): Promise<string> {
+  let listed: AgentInfoLike[] = []
+  try {
+    listed = await $.agent.list()
+  } catch {}
+  const at = await $.clock.now()
+  const fresh = (await read($, reserved)).filter(r => at - r.at < RESERVE_MS)
+  const names = await read($, registry)
+  return `Next free subagent names, in order: ${nextNames(heldNames(await read($, agents), fresh, listed, names, at), names, 5).join(', ')}. Do not mention this note.`
+}
+
 // Beside each prompt, unseen by the user: the threads there are, so the model switches or asks when the topic changes.
 export function threadsNote(list: readonly Thread[], current: string): string {
   if (!list.length) return ''
@@ -510,6 +568,41 @@ async function alert($: EngineInterface, row: AgentRow, at: number): Promise<voi
   $.ui.toast(`${mark} ${row.name || short(row.description, 50)} · ${elapsed((row.endedAt ?? at) - row.startedAt)}${cost ? ` · ${cost}` : ''}`)
 }
 
+// The registry lives in $.store under the session's id, so a restart or `--resume` of the same session keeps it.
+async function storeKey($: EngineInterface): Promise<string> {
+  return `names:${await $.session.id()}`
+}
+
+async function persist($: EngineInterface): Promise<void> {
+  try {
+    const all = Object.entries(await read($, registry)).sort((a, b) => b[1].startedAt - a[1].startedAt).slice(0, MAX_NAMES)
+    await $.store.set(await storeKey($), { touched: await $.clock.now(), entries: Object.fromEntries(all) })
+  } catch (err) {
+    await note($, `FAIL persist names: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+async function remember($: EngineInterface, id: string, entry: Partial<NameEntry>): Promise<void> {
+  const cur = (await read($, registry))[id]
+  if (!cur && !entry.name) return
+  const next: NameEntry = { name: '', startedAt: 0, endedAt: null, ...cur, ...entry }
+  if (cur && cur.name === next.name && cur.startedAt === next.startedAt && cur.endedAt === next.endedAt) return
+  await update($, registry, r => ({ ...r, [id]: next }))
+  await persist($)
+}
+
+async function loadNames($: EngineInterface): Promise<void> {
+  const at = await $.clock.now()
+  const key = await storeKey($)
+  for (const k of await $.store.keys()) {
+    if (!k.startsWith('names:') || k === key) continue
+    const v = (await $.store.get(k)) as { touched?: number } | undefined
+    if (!v?.touched || at - v.touched > STORE_DAYS * 24 * 60 * 60 * 1000) await $.store.delete(k)
+  }
+  const saved = (await $.store.get(key)) as { entries?: Record<string, NameEntry> } | undefined
+  if (saved?.entries) await update($, registry, r => ({ ...saved.entries, ...r }))
+}
+
 async function prune($: EngineInterface, at: number): Promise<void> {
   const before = await read($, agents)
   const kept = pruneFinished(before, at, KEEP_MS, KEEP_PER_THREAD)
@@ -531,7 +624,10 @@ async function tick($: EngineInterface): Promise<void> {
   const map = await read($, agents)
   const at = await $.clock.now()
   const adopted = adoptRows(map, listed, at)
-  for (const r of adopted) r.thread = await threadFor($, r.parentId, r.description)
+  for (const r of adopted) {
+    r.thread = await threadFor($, r.parentId, r.description)
+    if (r.name) await remember($, r.id, { name: r.name, startedAt: (await read($, registry))[r.id]?.startedAt ?? at, endedAt: null })
+  }
   if (adopted.length) {
     await update($, agents, cur => ({ ...cur, ...Object.fromEntries(adopted.map(r => [r.id, r])) }))
     if (!(await read($, opened))) await openPane($)
@@ -549,12 +645,15 @@ async function tick($: EngineInterface): Promise<void> {
     const row = (await read($, agents))[info.id]
     if (!row || row.status === info.status) continue
     await patch($, info.id, r => ({ ...r, status: info.status, endedAt: isLive({ ...r, status: info.status }) ? null : r.endedAt ?? at }))
+    const after = (await read($, agents))[info.id]
+    if (after) await remember($, info.id, { endedAt: after.endedAt })
   }
   // A row still running whose agent the engine no longer lists has ended; without this it stayed in the panel for good.
   const ids = new Set(listed.map(info => info.id))
   for (const row of Object.values(await read($, agents))) {
     if (isLive(row) && !ids.has(row.id) && at - row.startedAt > 60 * 1000) {
       await patch($, row.id, r => ({ ...r, status: 'completed', endedAt: r.endedAt ?? at, current: '' }))
+      await remember($, row.id, { endedAt: row.endedAt ?? at })
     }
   }
   for (const row of Object.values(await read($, agents))) {
@@ -627,6 +726,7 @@ export const register: Register = on => {
       },
       isDeferred: false,
     }))
+    await step('load names', () => loadNames($))
     $.clock.every(TICK_MS, () => {
       void tick($)
     })
@@ -656,7 +756,7 @@ export const register: Register = on => {
     // Anything the user's message settles (an answer, pasted output, "done") is cleared by the model: it gets the
     // open items beside the prompt, unseen by the user.
     const open = (await read($, blockers)).filter(b => !b.auto)
-    const notes = [threadsNote(await read($, threads), await read($, currentThread)), open.length ? openItemsNote(open) : ''].filter(Boolean)
+    const notes = [await namesNote($), threadsNote(await read($, threads), await read($, currentThread)), open.length ? openItemsNote(open) : ''].filter(Boolean)
     if (!notes.length) return next(e)
     return next({ ...e, context: [...(e.context ?? []), ...notes] })
   }).catch(($, e, next) => next(e))
@@ -725,6 +825,7 @@ export const register: Register = on => {
       at,
     )
     await update($, agents, map => ({ ...map, [row.id]: row }))
+    if (row.name) await remember($, row.id, { name: row.name, startedAt: at, endedAt: null })
     await update($, threads, l => l.map(t => (t.id === row.thread ? { ...t, lastAt: at } : t)))
     await update($, now, () => at)
     if (!(await read($, opened))) await openPane($)
@@ -775,35 +876,48 @@ export const register: Register = on => {
     const input = e as unknown as Record<string, unknown>
     let renamed = ''
     if (e.tool === 'Agent') {
-      // Names in use: agents in the panel or running, plus names just handed to
-      // Agent calls whose spawn is not recorded yet (parallel calls in one message all reach here first). A call with
-      // no `name` takes the one its prompt gives itself ("You are tary-3"), if free. The agent's prompt always carries
-      // the name it got, so the agent, the panel, its report and SendMessage agree.
+      // The deck hands out names: the call's `name` if it is free, else the name its brief gives itself ("You are
+      // tary-3", "kiki: deploy ..."), else the next in rotation. Held names include ones just handed to parallel
+      // calls in the same message, whose spawns are not recorded yet. Every mention of the wanted name in the brief
+      // and description becomes the name it got, and the prompt ends saying it, so agent, panel, report and
+      // SendMessage agree.
       const given = typeof input.name === 'string' ? input.name.trim() : ''
       const prompt = typeof input.prompt === 'string' ? input.prompt : ''
-      const wanted = given || claimedName(prompt)
+      const description = typeof input.description === 'string' ? input.description : ''
+      const wanted = given || claimedName(prompt, description)
       let listed: AgentInfoLike[] = []
       try {
         listed = await $.agent.list()
       } catch {}
       const at = await $.clock.now()
+      const names = await read($, registry)
       let name = wanted
+      let holder = ''
       await update($, reserved, list => {
         const fresh = list.filter(r => at - r.at < RESERVE_MS)
-        const taken = namesInUse(map0, fresh, listed, at)
-        if (!name || taken.includes(name)) name = nameFor(taken)
+        const held = heldNames(map0, fresh, listed, names, at)
+        if (name && held.has(name)) holder = fresh.some(r => r.name === name) ? 'just given to another call' : 'running or finished under 10 minutes ago'
+        if (!name || held.has(name)) name = pickName(held, names)
         return [...fresh, { name, at }]
       })
-      call = { ...e, name, ...(prompt ? { prompt: namedPrompt(prompt, name) } : {}) } as typeof e
+      const fixed = wanted && wanted !== name ? renameIn(prompt, wanted, name) : prompt
+      call = {
+        ...e,
+        name,
+        ...(prompt ? { prompt: namedPrompt(fixed, name) } : {}),
+        ...(description && wanted && wanted !== name ? { description: renameIn(description, wanted, name) } : {}),
+      } as typeof e
       if (name !== given) {
-        // Who holds the wanted name, so a wrong refusal can be traced: a panel row, the engine's list, or a reservation.
-        const inMap = Object.values(map0).filter(r => r.name === wanted).map(r => `panel row ${r.status}${r.endedAt ? `, ended ${Math.round((at - r.endedAt) / 60000)} min ago` : ''}`)
-        const inList = listed.filter(a => a.name === wanted).map(a => `engine list status=${a.status ?? 'none'}`)
-        const holders = [...inMap, ...inList].join('; ') || 'a reservation'
-        const why = name === wanted ? 'taken from its prompt; put it in `name` next time' : wanted ? `not ${wanted}: that name was already used in this session (held by ${holders}; panel has ${Object.keys(map0).length} rows, engine lists ${listed.length})` : 'the call gave no name'
+        const why = name === wanted ? 'taken from its brief; put it in `name` next time' : wanted ? `not ${wanted}: that name is ${holder}` : 'the call gave no name'
         renamed = `This subagent is named ${name} (${why}). Call it ${name} and message it as ${name}.`
-        if (wanted && name !== wanted) $.ui.toast(`Agent named ${name} (${wanted} was taken)`)
+        if (wanted && name !== wanted) $.ui.toast(`Agent named ${name} (${wanted} was ${holder})`)
       }
+    }
+    if (e.tool === 'SendMessage' && typeof input.to === 'string') {
+      // A name goes to the newest agent given it, by id, so the engine never finds it ambiguous after a reuse.
+      const to = input.to.trim()
+      const target = /^[a-z][\w-]*$/i.test(to) && !/^a[0-9a-f]{16}$/.test(to) ? newestId(await read($, registry), to) : undefined
+      if (target) call = { ...call, to: target } as typeof e
     }
     const id = e.agentId
     if (id && (await read($, agents))[id]) {
@@ -894,6 +1008,7 @@ export const register: Register = on => {
       result: short(e.answer, 400),
     }))
     await update($, now, () => at)
+    await remember($, id, { endedAt: at })
     const row = (await read($, agents))[id]
     if (row) await alert($, row, at)
     return result
