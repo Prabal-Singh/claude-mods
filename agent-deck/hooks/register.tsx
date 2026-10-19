@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentMap, AgentRow, Blocker, Reservation } from '../types'
+import type { AgentMap, AgentRow, Blocker, Reservation, Thread } from '../types'
 
 const PANE = 'agents'
 const TITLE = 'Agents'
@@ -12,6 +12,10 @@ const REPLY_COMMAND_TTL_MS = 2 * 60 * 60 * 1000
 const FLAG_TTL_MS = 24 * 60 * 60 * 1000
 // Finished agents leave the panel this long after they end (their pop-up already said how it went).
 const DONE_TTL_MS = 10 * 60 * 1000
+// Finished rows stay in their thread's dropdown this long (their names are free after DONE_TTL_MS), at most
+// KEEP_PER_THREAD of them per thread; older ones only add to the thread's counts.
+const KEEP_MS = 60 * 60 * 1000
+const KEEP_PER_THREAD = 8
 const MAY_SPAWN =
   '\n\nYou may spawn your own subagents (Agent tool) for parts of this task that split cleanly; give each a precise brief.'
 
@@ -25,13 +29,27 @@ export const NAMES = [
 const SPAWN_RULE =
   'Subagents may spawn their own subagents (Agent tool) for parts of their task that split cleanly. ' +
   'When you brief a subagent whose work may split, pick an agent type that has the Agent tool, and give each a precise brief. ' +
-  'Always give every subagent a name (the Agent tool\'s `name`): the first Vox Machina character no agent has had in this ' +
-  `session (finished agents keep theirs), in this order: ${NAMES.join(', ')} (past the list, add -2: grog-2). ` +
+  'Always give every subagent a name (the Agent tool\'s `name`): the first Vox Machina character not used by a running ' +
+  `agent or one still in the Agents panel, in this order: ${NAMES.join(', ')} (past the list, add -2: grog-2). ` +
+  'A finished agent leaves the panel 10 minutes after it ends and its name is free again. ' +
   'Put the name in `name`, not only in the prompt. If the name was taken, the Agent result says which name the agent got: ' +
   'use that one. Refer to each subagent by its name when you talk about it or message it. ' +
   'When a subagent\'s context grows big (about 200k tokens, many rounds of fixes or rebases, or it gets slow), retire it: ' +
   'make sure its committed work is pushed, note its uncommitted changes, stop it, and hand a fresh agent in the same ' +
   'worktree a tight brief plus that leftover work (the /retire command spells out the steps).'
+
+const THREAD_TOOL = 'work_thread'
+const THREAD_FULL = `mcp__agent-deck__${THREAD_TOOL}`
+
+// Told to every loop; only the main conversation acts on it (a subagent's children join its thread by themselves).
+const THREAD_RULE =
+  'This terminal can carry several work threads (topics) at once, each with its own subagents, shown as dropdowns in the ' +
+  `Agents panel. In the main conversation with the user (never as a subagent): before you spawn subagents for a request, ` +
+  `make sure the current work thread fits it. When the user starts a new topic or goes back to an earlier one, call ` +
+  `${THREAD_FULL} with a 2-5 word title (an existing title switches back to that thread). If it is unclear whether the ` +
+  'request belongs to an existing thread or a new one, ask with AskUserQuestion: the likely existing threads as options, ' +
+  'plus a suggested title for a new one. Do not ask when it is clear. If a thread has an auto title that does not fit ' +
+  `its work, call ${THREAD_FULL} with \`rename: true\` and a better title.`
 
 const BLOCK_TOOL = 'blocked_on_user'
 const CLEAR_TOOL = 'unblocked'
@@ -55,6 +73,10 @@ const reserved = atom({ plugin: 'agent-deck', key: 'reserved' } as const, [])
 // A name handed to an Agent call is held this long, until its spawn is recorded.
 const RESERVE_MS = 2 * 60 * 1000
 const blockerSeq = atom({ plugin: 'agent-deck', key: 'blockerSeq' } as const, 0)
+const threads = atom({ plugin: 'agent-deck', key: 'threads' } as const, [])
+const currentThread = atom({ plugin: 'agent-deck', key: 'currentThread' } as const, '')
+// A dropdown the user opened or closed; others are open while current or running something.
+const threadOpen = atom({ plugin: 'agent-deck', key: 'threadOpen' } as const, {})
 
 // Estimated list prices, USD per million tokens [input, output]; cache reads 0.1x input, cache writes 1.25x.
 const PRICES: [RegExp, number, number][] = [
@@ -90,10 +112,19 @@ export function nameFor(taken: readonly string[]): string {
   }
 }
 
-// Every name an agent has had this session, running or finished: a name is never handed out twice, so SendMessage and
-// the reports always mean one agent. Rows that left the panel are still in the engine's list.
-export function namesInUse(map: AgentMap, held: readonly Reservation[], listed: readonly { name?: string }[] = []): string[] {
-  const all = [...Object.values(map).map(r => r.name), ...listed.map(a => a.name ?? ''), ...held.map(r => r.name)]
+// Names held now: every agent in the panel (running, or finished less than DONE_TTL_MS ago), every agent the engine
+// lists as running, and names just handed to Agent calls. A name frees up once its agent has left the panel, so the
+// list starts again at kiki instead of climbing to kiki-7.
+export function namesInUse(
+  map: AgentMap,
+  held: readonly Reservation[],
+  listed: readonly { name?: string; status?: string }[] = [],
+  at?: number,
+): string[] {
+  const live = listed.filter(a => !a.status || ['running', 'pending', 'waiting'].includes(a.status))
+  // Rows stay in their thread for an hour, but hold their name only DONE_TTL_MS after they end.
+  const holding = Object.values(map).filter(r => at === undefined || isLive(r) || at - (r.endedAt ?? r.lastActivity) <= DONE_TTL_MS)
+  const all = [...holding.map(r => r.name), ...live.map(a => a.name ?? ''), ...held.map(r => r.name)]
   return [...new Set(all.filter(Boolean))]
 }
 
@@ -206,13 +237,47 @@ function tokens(n: number): string {
   return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n)
 }
 
-// Drops finished agents that ended more than DONE_TTL_MS ago, keeping any with a running agent under them.
-export function pruneFinished(map: AgentMap, at: number): AgentMap {
+// Drops finished agents that ended more than `keep` ago, and past the newest `perThread` finished roots of a thread,
+// keeping any with a running agent under them.
+export function pruneFinished(map: AgentMap, at: number, keep = DONE_TTL_MS, perThread = Infinity): AgentMap {
   const liveUnder = (id: string): boolean =>
     Object.values(map).some(r => r.parentId === id && (isLive(r) || liveUnder(r.id)))
+  const rootOf = (r: AgentRow): AgentRow => (r.parentId && map[r.parentId] ? rootOf(map[r.parentId]!) : r)
+  const finishedRoots = new Map<string, string[]>()
+  for (const r of Object.values(map).filter(r => !r.parentId || !map[r.parentId]).sort((a, b) => b.startedAt - a.startedAt)) {
+    if (isLive(r) || liveUnder(r.id)) continue
+    finishedRoots.set(r.thread, [...(finishedRoots.get(r.thread) ?? []), r.id])
+  }
+  const overCap = new Set([...finishedRoots.values()].flatMap(ids => ids.slice(perThread)))
   return Object.fromEntries(
-    Object.entries(map).filter(([id, r]) => isLive(r) || at - (r.endedAt ?? r.lastActivity) <= DONE_TTL_MS || liveUnder(id)),
+    Object.entries(map).filter(([id, r]) => {
+      if (isLive(r) || liveUnder(id)) return true
+      return at - (r.endedAt ?? r.lastActivity) <= keep && !overCap.has(rootOf(r).id)
+    }),
   )
+}
+
+// A title from a few words of a task: "Fix e2e tests group A" stays, long ones are cut at a word.
+export function autoTitle(text: string): string {
+  const words = text.replace(/[`*_#>]/g, '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean)
+  let out = ''
+  for (const w of words) {
+    if ((out ? `${out} ${w}` : w).length > 32) break
+    out = out ? `${out} ${w}` : w
+  }
+  return out || 'Untitled work'
+}
+
+// Dropdown order: the current thread, then threads running something, then the most recently active.
+export function threadOrder(list: readonly Thread[], map: AgentMap, current: string): Thread[] {
+  const live = (t: Thread) => Number(Object.values(map).some(r => r.thread === t.id && isLive(r)))
+  return [...list].sort((a, b) => Number(b.id === current) - Number(a.id === current) || live(b) - live(a) || b.lastAt - a.lastAt)
+}
+
+// The thread an existing title names, matched loosely ("vingo agent" finds "Vingo agent").
+export function findThread(list: readonly Thread[], title: string): Thread | undefined {
+  const norm = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  return list.find(t => norm(t.title) === norm(title))
 }
 
 export function newRow(over: Partial<AgentRow> & { id: string }, at: number): AgentRow {
@@ -220,8 +285,60 @@ export function newRow(over: Partial<AgentRow> & { id: string }, at: number): Ag
     name: '', description: '', type: '', parentId: null, model: '', status: 'running', prompt: '',
     startedAt: at, endedAt: null, lastActivity: at, tools: 0, current: '', recent: [], files: [],
     tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, result: '',
-    alerted: false, stuckAlerted: false, joinedLate: false, ...over,
+    alerted: false, stuckAlerted: false, joinedLate: false, thread: '', ...over,
   }
+}
+
+// Makes `title` the current thread: an existing one by title, else a new one; with `rename`, the current one is
+// renamed instead (an auto title that turned out wrong).
+async function setThread($: EngineInterface, title: string, opts: { rename?: boolean; auto?: boolean } = {}): Promise<Thread> {
+  const at = await $.clock.now()
+  const list = await read($, threads)
+  const curId = await read($, currentThread)
+  const cur = list.find(t => t.id === curId)
+  const clean = title.replace(/\s+/g, ' ').trim().slice(0, 48) || 'Untitled work'
+  let picked: Thread
+  if (opts.rename && cur && !findThread(list, clean)) {
+    picked = { ...cur, title: clean, auto: false, lastAt: at }
+    await update($, threads, l => l.map(t => (t.id === cur.id ? picked : t)))
+  } else {
+    const found = findThread(list, clean)
+    picked = found
+      ? { ...found, lastAt: at }
+      : { id: `t${list.length + 1}-${at.toString(36)}`, title: clean, auto: !!opts.auto, createdAt: at, lastAt: at, archived: { done: 0, failed: 0, cost: 0 } }
+    await update($, threads, l => (found ? l.map(t => (t.id === found.id ? picked : t)) : [...l, picked]))
+  }
+  await update($, currentThread, () => picked.id)
+  return picked
+}
+
+// The thread a new agent joins: its parent's, else the current one, else a new one titled from its task.
+async function threadFor($: EngineInterface, parentId: string | null, description: string): Promise<string> {
+  const parent = parentId ? (await read($, agents))[parentId] : undefined
+  if (parent?.thread) return parent.thread
+  const id = await read($, currentThread)
+  if (id && (await read($, threads)).some(t => t.id === id)) return id
+  return (await setThread($, autoTitle(description), { auto: true })).id
+}
+
+// Rows leaving the panel still count in their thread's header.
+async function archive($: EngineInterface, gone: readonly AgentRow[]): Promise<void> {
+  if (!gone.length) return
+  await update($, threads, l =>
+    l.map(t => {
+      const mine = gone.filter(r => r.thread === t.id)
+      if (!mine.length) return t
+      const failed = mine.filter(r => r.status === 'failed' || r.status === 'killed').length
+      return {
+        ...t,
+        archived: {
+          done: t.archived.done + mine.length - failed,
+          failed: t.archived.failed + failed,
+          cost: t.archived.cost + mine.reduce((s, r) => s + r.costUsd, 0),
+        },
+      }
+    }),
+  )
 }
 
 // Agents this mod never saw spawn (they started before it loaded): add them from the engine's list.
@@ -317,6 +434,18 @@ export function ranCommand(text: string): string | null {
   return bang && bang[1] ? bang[1].trim() : null
 }
 
+// Beside each prompt, unseen by the user: the threads there are, so the model switches or asks when the topic changes.
+export function threadsNote(list: readonly Thread[], current: string): string {
+  if (!list.length) return ''
+  const cur = list.find(t => t.id === current)
+  const others = list.filter(t => t.id !== current).sort((a, b) => b.lastAt - a.lastAt).slice(0, 8).map(t => `"${t.title}"`)
+  return (
+    `Work threads in the Agents panel: current ${cur ? `"${cur.title}"${cur.auto ? ' (auto title)' : ''}` : 'none'}` +
+    `${others.length ? `; others ${others.join(', ')}` : ''}. If this message moves to another topic, switch with ` +
+    `${THREAD_FULL} before spawning subagents (ask with options when unsure). Do not mention this note.`
+  )
+}
+
 export function openItemsNote(open: readonly Blocker[]): string {
   const lines = open.map(b => `- ${b.id} (${b.kind}): ${b.what}${b.command ? ` — command: ${short(b.command.replace(/\s+/g, ' '), 120)}` : ''}`)
   return (
@@ -381,7 +510,18 @@ async function alert($: EngineInterface, row: AgentRow, at: number): Promise<voi
   $.ui.toast(`${mark} ${row.name || short(row.description, 50)} · ${elapsed((row.endedAt ?? at) - row.startedAt)}${cost ? ` · ${cost}` : ''}`)
 }
 
+async function prune($: EngineInterface, at: number): Promise<void> {
+  const before = await read($, agents)
+  const kept = pruneFinished(before, at, KEEP_MS, KEEP_PER_THREAD)
+  if (Object.keys(kept).length === Object.keys(before).length) return
+  await update($, agents, cur => Object.fromEntries(Object.entries(cur).filter(([id]) => kept[id] || !before[id])))
+  await archive($, Object.values(before).filter(r => !kept[r.id]))
+  await update($, now, () => at)
+}
+
 async function tick($: EngineInterface): Promise<void> {
+  // Finished rows leave first, whatever the engine's list does: a failed list call used to skip this, so they stayed.
+  await prune($, await $.clock.now())
   let listed: AgentInfoLike[] = []
   try {
     listed = await $.agent.list()
@@ -391,6 +531,7 @@ async function tick($: EngineInterface): Promise<void> {
   const map = await read($, agents)
   const at = await $.clock.now()
   const adopted = adoptRows(map, listed, at)
+  for (const r of adopted) r.thread = await threadFor($, r.parentId, r.description)
   if (adopted.length) {
     await update($, agents, cur => ({ ...cur, ...Object.fromEntries(adopted.map(r => [r.id, r])) }))
     if (!(await read($, opened))) await openPane($)
@@ -400,12 +541,7 @@ async function tick($: EngineInterface): Promise<void> {
     await dropBlocker($, b => !b.auto && at - b.since > (b.id.startsWith('cmd-') ? REPLY_COMMAND_TTL_MS : FLAG_TTL_MS))
     await update($, now, () => at)
   }
-  const before = await read($, agents)
-  const kept = pruneFinished(before, at)
-  if (Object.keys(kept).length !== Object.keys(before).length) {
-    await update($, agents, () => kept)
-    await update($, now, () => at)
-  }
+  await prune($, at)
   const rows = Object.values(await read($, agents))
   if (!rows.some(isLive)) return
   await update($, now, () => at)
@@ -413,6 +549,13 @@ async function tick($: EngineInterface): Promise<void> {
     const row = (await read($, agents))[info.id]
     if (!row || row.status === info.status) continue
     await patch($, info.id, r => ({ ...r, status: info.status, endedAt: isLive({ ...r, status: info.status }) ? null : r.endedAt ?? at }))
+  }
+  // A row still running whose agent the engine no longer lists has ended; without this it stayed in the panel for good.
+  const ids = new Set(listed.map(info => info.id))
+  for (const row of Object.values(await read($, agents))) {
+    if (isLive(row) && !ids.has(row.id) && at - row.startedAt > 60 * 1000) {
+      await patch($, row.id, r => ({ ...r, status: 'completed', endedAt: r.endedAt ?? at, current: '' }))
+    }
   }
   for (const row of Object.values(await read($, agents))) {
     await alert($, row, at)
@@ -463,6 +606,27 @@ export const register: Register = on => {
       inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
       isDeferred: false,
     }))
+    await step('command thread', () => $.command.register({
+      name: 'thread',
+      description: 'Switch work thread (topic) for new subagents, or list them: /thread [title]',
+      argumentHint: '[title]',
+    }))
+    await step('tool work_thread', () => $.tool.register({
+      name: THREAD_TOOL,
+      description:
+        'Set the work thread (topic) that new subagents belong to; the Agents panel groups agents by thread. A title that ' +
+        'matches an existing thread switches back to it, a new title starts one, `rename: true` renames the current one. ' +
+        'Returns every thread.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: '2-5 words naming the topic, e.g. "Vingo WhatsApp agent".' },
+          rename: { type: 'boolean', description: 'Rename the current thread instead of switching.' },
+        },
+        required: ['title'],
+      },
+      isDeferred: false,
+    }))
     $.clock.every(TICK_MS, () => {
       void tick($)
     })
@@ -474,7 +638,10 @@ export const register: Register = on => {
   on('prompt.compose', async ($, e, next) => {
     const result = await next(e)
     const added = [{ id: 'agent-deck:blocked', text: BLOCK_RULE, scope: 'session' as const }]
-    if (e.tools.includes('Agent')) added.unshift({ id: 'agent-deck:spawn', text: SPAWN_RULE, scope: 'session' as const })
+    if (e.tools.includes('Agent')) {
+      added.unshift({ id: 'agent-deck:threads', text: THREAD_RULE, scope: 'session' as const })
+      added.unshift({ id: 'agent-deck:spawn', text: SPAWN_RULE, scope: 'session' as const })
+    }
     return { sections: [...result.sections, ...added] }
   })
 
@@ -489,8 +656,9 @@ export const register: Register = on => {
     // Anything the user's message settles (an answer, pasted output, "done") is cleared by the model: it gets the
     // open items beside the prompt, unseen by the user.
     const open = (await read($, blockers)).filter(b => !b.auto)
-    if (!open.length) return next(e)
-    return next({ ...e, context: [...(e.context ?? []), openItemsNote(open)] })
+    const notes = [threadsNote(await read($, threads), await read($, currentThread)), open.length ? openItemsNote(open) : ''].filter(Boolean)
+    if (!notes.length) return next(e)
+    return next({ ...e, context: [...(e.context ?? []), ...notes] })
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'deck' }, async $ => {
@@ -519,7 +687,8 @@ export const register: Register = on => {
     if (!map[hit.id]) {
       const info = listed.find(a => a.id === hit.id)
       const at = await $.clock.now()
-      if (info) await update($, agents, cur => ({ ...cur, [hit.id]: newRow({ id: info.id, name: info.name ?? '', description: info.description, type: info.type, parentId: info.parentId ?? null, status: info.status, endedAt: at, current: '', alerted: true, joinedLate: true }, at) }))
+      const thread = await read($, currentThread)
+      if (info) await update($, agents, cur => ({ ...cur, [hit.id]: newRow({ id: info.id, name: info.name ?? '', description: info.description, type: info.type, parentId: info.parentId ?? null, status: info.status, endedAt: at, current: '', alerted: true, joinedLate: true, thread }, at) }))
     }
     await update($, expanded, () => hit.id)
     await openPane($)
@@ -551,14 +720,38 @@ export const register: Register = on => {
         model: result.model ?? e.model ?? '',
         prompt: short(e.prompt, 300),
         current: 'starting',
+        thread: await threadFor($, e.parentAgentId ?? null, e.description),
       },
       at,
     )
     await update($, agents, map => ({ ...map, [row.id]: row }))
+    await update($, threads, l => l.map(t => (t.id === row.thread ? { ...t, lastAt: at } : t)))
     await update($, now, () => at)
     if (!(await read($, opened))) await openPane($)
     return result
   }).catch(($, e, next) => next(e))
+
+  on('tool.call', { tool: THREAD_FULL }, async ($, e) => {
+    const input = e as unknown as Record<string, unknown>
+    if (e.agentId) return { result: 'Subagents stay in their parent\'s work thread; nothing changed.' }
+    const title = typeof input.title === 'string' ? input.title : ''
+    if (!title.trim()) return { result: 'Give a title.' }
+    const t = await setThread($, title, { rename: input.rename === true })
+    const list = (await read($, threads)).map(x => `${x.id === t.id ? '* ' : '  '}${x.title}`).join('\n')
+    return { result: `Current work thread: ${t.title}. New subagents join it.\nThreads:\n${list}` }
+  })
+
+  on('command.run', { command: 'thread' }, async ($, e) => {
+    const title = e.args.trim()
+    if (!title) {
+      const list = await read($, threads)
+      const cur = await read($, currentThread)
+      return { text: list.length ? `Work threads:\n${list.map(t => `${t.id === cur ? '* ' : '  '}${t.title}`).join('\n')}\n/thread <title> switches or starts one.` : 'No work threads yet. /thread <title> starts one.' }
+    }
+    const t = await setThread($, title)
+    await update($, threadOpen, o => ({ ...o, [t.id]: true }))
+    return { text: `Work thread: ${t.title}. New subagents join it.` }
+  }).catch(() => ({ text: '/thread: could not switch.' }))
 
   on('tool.call', { tool: BLOCK_FULL }, async ($, e) => {
     const input = e as unknown as Record<string, unknown>
@@ -582,7 +775,7 @@ export const register: Register = on => {
     const input = e as unknown as Record<string, unknown>
     let renamed = ''
     if (e.tool === 'Agent') {
-      // A name is never handed out twice in a session: names of running and finished agents, plus names just handed to
+      // Names in use: agents in the panel or running, plus names just handed to
       // Agent calls whose spawn is not recorded yet (parallel calls in one message all reach here first). A call with
       // no `name` takes the one its prompt gives itself ("You are tary-3"), if free. The agent's prompt always carries
       // the name it got, so the agent, the panel, its report and SendMessage agree.
@@ -597,13 +790,17 @@ export const register: Register = on => {
       let name = wanted
       await update($, reserved, list => {
         const fresh = list.filter(r => at - r.at < RESERVE_MS)
-        const taken = namesInUse(map0, fresh, listed)
+        const taken = namesInUse(map0, fresh, listed, at)
         if (!name || taken.includes(name)) name = nameFor(taken)
         return [...fresh, { name, at }]
       })
       call = { ...e, name, ...(prompt ? { prompt: namedPrompt(prompt, name) } : {}) } as typeof e
       if (name !== given) {
-        const why = name === wanted ? 'taken from its prompt; put it in `name` next time' : wanted ? `not ${wanted}: that name was already used in this session` : 'the call gave no name'
+        // Who holds the wanted name, so a wrong refusal can be traced: a panel row, the engine's list, or a reservation.
+        const inMap = Object.values(map0).filter(r => r.name === wanted).map(r => `panel row ${r.status}${r.endedAt ? `, ended ${Math.round((at - r.endedAt) / 60000)} min ago` : ''}`)
+        const inList = listed.filter(a => a.name === wanted).map(a => `engine list status=${a.status ?? 'none'}`)
+        const holders = [...inMap, ...inList].join('; ') || 'a reservation'
+        const why = name === wanted ? 'taken from its prompt; put it in `name` next time' : wanted ? `not ${wanted}: that name was already used in this session (held by ${holders}; panel has ${Object.keys(map0).length} rows, engine lists ${listed.length})` : 'the call gave no name'
         renamed = `This subagent is named ${name} (${why}). Call it ${name} and message it as ${name}.`
         if (wanted && name !== wanted) $.ui.toast(`Agent named ${name} (${wanted} was taken)`)
       }
@@ -708,15 +905,24 @@ export const register: Register = on => {
     const open = await read($, expanded)
     const at = Math.max(await read($, now), ...Object.values(map).map(r => r.lastActivity))
     const rows = Object.values(map)
-    const lines = treeLines(map)
-    const total = rows.reduce((sum, r) => sum + r.costUsd, 0)
-    const count = (s: string[]) => rows.filter(r => s.includes(r.status)).length
-    const head = [
-      `${count(['running', 'pending', 'waiting'])} running`,
-      `${count(['completed'])} done`,
-      count(['failed', 'killed']) ? `${count(['failed', 'killed'])} failed` : '',
-      money(total),
+    const tlist = await read($, threads)
+    const cur = await read($, currentThread)
+    const openMap = await read($, threadOpen)
+    // Rows whose thread is gone (or never set) show under "Other".
+    const known = new Set(tlist.map(t => t.id))
+    const threadOf = (r: AgentRow) => (known.has(r.thread) ? r.thread : '')
+    const ordered = threadOrder(tlist, map, cur)
+    if (rows.some(r => !threadOf(r))) ordered.push({ id: '', title: 'Other', auto: true, createdAt: 0, lastAt: 0, archived: { done: 0, failed: 0, cost: 0 } })
+    const archived = tlist.reduce((acc, t) => ({ done: acc.done + t.archived.done, failed: acc.failed + t.archived.failed, cost: acc.cost + t.archived.cost }), { done: 0, failed: 0, cost: 0 })
+    const total = rows.reduce((sum, r) => sum + r.costUsd, 0) + archived.cost
+    const count = (s: string[], list: AgentRow[] = rows) => list.filter(r => s.includes(r.status)).length
+    const summary = (list: AgentRow[], arch: Thread['archived'], usd: number) => [
+      count(['running', 'pending', 'waiting'], list) ? `${count(['running', 'pending', 'waiting'], list)} running` : '',
+      count(['completed', 'idle'], list) + arch.done ? `${count(['completed', 'idle'], list) + arch.done} done` : '',
+      count(['failed', 'killed'], list) + arch.failed ? `${count(['failed', 'killed'], list) + arch.failed} failed` : '',
+      money(usd),
     ].filter(Boolean).join(' · ')
+    const head = summary(rows, archived, total) || '0 running'
     const blocked = await read($, blockers)
     const ORDER = ['decision', 'access', 'review', 'question', 'plan', 'permission', 'command', 'other', 'waiting']
     const rank = (b: Blocker) => (ORDER.indexOf(b.kind) + 1 || ORDER.length) * 2 + Number(b.auto)
@@ -726,22 +932,33 @@ export const register: Register = on => {
     const half = Math.max(6, Math.floor((e.props.scroll?.bodyRows ?? 24) / 2))
     const width = Math.max(24, e.props.bodyColumns ?? 56)
     const fit = (text: string, room: number) => (text.length > room ? `${text.slice(0, Math.max(1, room - 1))}…` : text)
-    // Rows never shrink: they are cut whole. Running agents take two lines, finished ones one, an open row its details.
-    const budget = half - 2
+    // Rows never shrink: they are cut whole. Every thread gets its header line first; then open threads fill the rest
+    // in order. Running agents take two lines, finished ones one, an open row its details.
+    let budget = half - 2
     const cost = (r: AgentRow) =>
       (isLive(r) ? 2 : 1) + (open === r.id ? 4 + r.files.length + (r.result ? 2 : 0) : 0)
-    const shown: TreeLine[] = []
-    let used = 0
-    let hidden = 0
-    for (const line of lines) {
-      const need = cost(line.row)
-      if (used + need > budget && !(isLive(line.row) && used + need <= budget + 2)) {
-        hidden++
-        continue
+    const heads = ordered.slice(0, Math.max(1, budget))
+    const hiddenThreads = ordered.length - heads.length
+    budget -= heads.length + (hiddenThreads ? 1 : 0)
+    const groups = heads.map(t => {
+      const mine = rows.filter(r => threadOf(r) === t.id)
+      const isOpenThread = openMap[t.id] ?? (t.id === cur || mine.some(isLive))
+      const shown: TreeLine[] = []
+      let hidden = 0
+      if (isOpenThread) {
+        for (const line of treeLines(Object.fromEntries(mine.map(r => [r.id, r])))) {
+          const need = cost(line.row)
+          if (need > budget && !(isLive(line.row) && need <= budget + 2)) {
+            hidden++
+            continue
+          }
+          shown.push(line)
+          budget -= need
+        }
       }
-      shown.push(line)
-      used += need
-    }
+      const usd = mine.reduce((sum, r) => sum + r.costUsd, 0) + t.archived.cost
+      return { t, mine, isOpenThread, shown, hidden, stats: summary(mine, t.archived, usd) }
+    })
     const color = (r: AgentRow) => {
       const g = glyph(r, at)
       return g === '⚠' ? 'warning' : g === '✓' ? 'success' : g === '✗' || g === '■' ? 'error' : 'claude'
@@ -751,50 +968,63 @@ export const register: Register = on => {
       <Box flexDirection="column">
        <Box flexDirection="column" height={half} overflow="hidden" flexShrink={0}>
         {rows.length === 0 ? (
-          <Text dimColor>No subagents yet. They show here as a tree when one starts.</Text>
+          <Text dimColor>No subagents yet. They show here by work thread when one starts.</Text>
         ) : (
           <Text bold>{head}</Text>
         )}
-        {shown.map(({ row, lead, cont, subtreeCost }) => {
-          const isOpen = open === row.id
-          const took = `${row.joinedLate ? '≥' : ''}${elapsed((row.endedAt ?? at) - row.startedAt)}`
-          const files = row.files.length ? `${row.files.length} file${row.files.length === 1 ? '' : 's'}` : ''
-          const label = row.name ? `${row.name} — ${short(row.description, 44)}` : short(row.description, 56)
-          const live = isLive(row)
-          const stats = live
-            ? [took, `${row.tools} tools`, files, money(subtreeCost), row.current].filter(Boolean).join(' · ')
-            : [took, files, money(subtreeCost)].filter(Boolean).join(' · ')
-          const room = Math.max(12, width - lead.length - 2)
-          const line1 = fit(live ? label : `${label} · ${stats}`, room)
-          return (
-            <Box key={row.id} flexDirection="column" flexShrink={0}>
-              <Box flexDirection="row" flexShrink={0}>
-                <Text dimColor>{lead}</Text>
-                <Text color={color(row)}>{glyph(row, at)} </Text>
-                <Button key={`row-${row.id}`} plain dimColor={!live} label={line1} onPress={() => update($, expanded, cur => (cur === row.id ? null : row.id))} />
-              </Box>
-              {live && <Text dimColor>{fit(`${cont}  ${stats}`, width)}</Text>}
-              {isOpen && (
-                <Box flexDirection="column" flexShrink={0}>
-                  <Text dimColor wrap="truncate-end">{cont}  {[row.type, row.model.replace(/^claude-/, '')].filter(Boolean).join(' · ')} · {row.tools} tools</Text>
-                  <Text wrap="wrap">{cont}  Task: {short(row.prompt.replace(MAY_SPAWN, ''), 200)}</Text>
-                  <Text dimColor>
-                    {cont}  Tokens: {tokens(row.tokensIn + row.cacheRead + row.cacheWrite)} in · {tokens(row.tokensOut)} out
-                  </Text>
-                  {row.files.length > 0 && <Text>{cont}  Files changed:</Text>}
-                  {row.files.map(f => (
-                    <Text key={`${row.id}-${f}`} color="diffAdded" wrap="truncate-start">
-                      {cont}    {tail(f)}
-                    </Text>
-                  ))}
-                  {row.recent.length > 0 && <Text dimColor wrap="truncate-end">{cont}  Last: {row.recent.slice(-3).join(' → ')}</Text>}
-                  {row.result && <Text wrap="wrap">{cont}  Result: {short(row.result, 300)}</Text>}
-                </Box>
-              )}
+        {groups.map(g => (
+          <Box key={`thread-${g.t.id || 'other'}`} flexDirection="column" flexShrink={0}>
+            <Box flexDirection="row" flexShrink={0}>
+              <Text color={g.t.id === cur ? 'claude' : undefined}>{g.isOpenThread ? '▾ ' : '▸ '}</Text>
+              <Button
+                key={`thread-btn-${g.t.id || 'other'}`}
+                plain
+                label={fit(`${g.t.title}${g.stats ? ` · ${g.stats}` : ''}${g.hidden ? ` · +${g.hidden} hidden` : ''}`, width - 3)}
+                onPress={() => update($, threadOpen, o => ({ ...o, [g.t.id]: !g.isOpenThread }))}
+              />
             </Box>
-          )
-        })}
-        {hidden > 0 && <Text dimColor>+{hidden} more not shown (oldest first) · click a row for details</Text>}
+          {g.shown.map(({ row, lead, cont, subtreeCost }) => {
+            const isOpen = open === row.id
+            const took = `${row.joinedLate ? '≥' : ''}${elapsed((row.endedAt ?? at) - row.startedAt)}`
+            const files = row.files.length ? `${row.files.length} file${row.files.length === 1 ? '' : 's'}` : ''
+            const label = row.name ? `${row.name} — ${short(row.description, 44)}` : short(row.description, 56)
+            const live = isLive(row)
+            const stats = live
+              ? [took, `${row.tools} tools`, files, money(subtreeCost), row.current].filter(Boolean).join(' · ')
+              : [took, files, money(subtreeCost)].filter(Boolean).join(' · ')
+            const room = Math.max(12, width - lead.length - 4)
+            const line1 = fit(live ? label : `${label} · ${stats}`, room)
+            return (
+              <Box key={row.id} flexDirection="column" flexShrink={0}>
+                <Box flexDirection="row" flexShrink={0}>
+                  <Text dimColor>{`  ${lead}`}</Text>
+                  <Text color={color(row)}>{glyph(row, at)} </Text>
+                  <Button key={`row-${row.id}`} plain dimColor={!live} label={line1} onPress={() => update($, expanded, cur => (cur === row.id ? null : row.id))} />
+                </Box>
+                {live && <Text dimColor>{fit(`  ${cont}  ${stats}`, width)}</Text>}
+                {isOpen && (
+                  <Box flexDirection="column" flexShrink={0}>
+                    <Text dimColor wrap="truncate-end">{cont}  {[row.type, row.model.replace(/^claude-/, '')].filter(Boolean).join(' · ')} · {row.tools} tools</Text>
+                    <Text wrap="wrap">{cont}  Task: {short(row.prompt.replace(MAY_SPAWN, ''), 200)}</Text>
+                    <Text dimColor>
+                      {cont}  Tokens: {tokens(row.tokensIn + row.cacheRead + row.cacheWrite)} in · {tokens(row.tokensOut)} out
+                    </Text>
+                    {row.files.length > 0 && <Text>{cont}  Files changed:</Text>}
+                    {row.files.map(f => (
+                      <Text key={`${row.id}-${f}`} color="diffAdded" wrap="truncate-start">
+                        {cont}    {tail(f)}
+                      </Text>
+                    ))}
+                    {row.recent.length > 0 && <Text dimColor wrap="truncate-end">{cont}  Last: {row.recent.slice(-3).join(' → ')}</Text>}
+                    {row.result && <Text wrap="wrap">{cont}  Result: {short(row.result, 300)}</Text>}
+                  </Box>
+                )}
+              </Box>
+            )
+          })}
+          </Box>
+        ))}
+        {hiddenThreads > 0 && <Text dimColor>+{hiddenThreads} more threads · /thread lists them</Text>}
        </Box>
        <Text bold color={needs.length ? 'warning' : undefined}>
          {needs.length ? `Blocked on you (${needs.length})` : 'Blocked on you'}

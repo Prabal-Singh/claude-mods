@@ -32,8 +32,8 @@ the open items (unseen), so when your message settles one ("go with B", pasted o
 replace the previous reply's, commands read from replies expire after 2 hours, and flagged items after 24 hours.
 
 **Names.** Every subagent gets a name, so you can refer to it and message it: Vox Machina, in order. `kiki`, `vex`,
-`vax`, `grog`, `pike`, `scanlan`, `percy`…, the first one no agent has had in this session (finished agents keep theirs,
-so `SendMessage` and the reports always mean one agent; `-2` once the list is used up). A call with no name takes the
+`vax`, `grog`, `pike`, `scanlan`, `percy`…, the first one not held by a running agent or one that finished in the
+last 10 minutes (so the list starts over at `kiki` instead of climbing to `kiki-8`; `-2` once all are held). A call with no name takes the
 one its brief gives itself ("You are tary-3"); a name already used is replaced, and the Agent result tells Claude the
 name the agent got. The agent's prompt always says its name, so the agent, the panel and its report agree.
 
@@ -41,6 +41,13 @@ name the agent got. The agent's prompt always says its name, so the agent, the p
 actions, result). With no name it lists them. **`/tell <name> <message>`** has Claude send it a message. Both
 autocomplete the name as you type it (running agents first); so does `/retire`. The full transcript is Claude Code's
 own view: `/tasks`, pick the agent, Enter.
+
+**Work threads.** One terminal can work on several topics at once. Each topic is a dropdown in the panel (▾ open,
+▸ closed; click its header) with its title, how many agents run, are done or failed, and its spend; its agents and
+their subagents sit under it. Claude switches threads with the `work_thread` tool when you change topic, asks you with
+options when it is unclear which topic a request belongs to, and a thread it never named gets an auto title from its
+first agent's task. **`/thread <title>`** switches (or starts) one yourself; `/thread` lists them. Finished agents
+stay in their thread for an hour (the newest 8), then only count in its header.
 
 **Subagents may spawn subagents.** Every subagent prompt says so, and agents are told to hand off parts that split
 cleanly.

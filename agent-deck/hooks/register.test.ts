@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-import { NAMES, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, namesInUse, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
+import { NAMES, autoTitle, findThread, threadOrder, threadsNote, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, namesInUse, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, nameFor, treeLines } from './register'
 import type { AgentRow } from '../types'
 
 const base = (id: string, over: Partial<AgentRow> = {}): AgentRow => ({
@@ -102,13 +102,20 @@ test('blocked on you: flagged items and open questions show in the lower half; D
   mock.clock(on, { now: 1000 })
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
   let release = () => {}
+  // The question reaches the engine only after the mod has flagged it: mount once it has.
+  let reached = () => {}
+  const atAsk = new Promise<void>(done => { reached = done })
   on('tool.call', ($, e) => {
-    if (e.tool === 'AskUserQuestion') return new Promise(done => { release = () => done({ result: 'Yes' }) })
+    if (e.tool === 'AskUserQuestion') {
+      reached()
+      return new Promise(done => { release = () => done({ result: 'Yes' }) })
+    }
     return { result: 'ok' }
   })
   const flagged = await $.tool.call({ tool: 'mcp__agent-deck__blocked_on_user', kind: 'command', what: 'gcloud login expired', command: 'gcloud auth login' } as never)
   expect(JSON.stringify(flagged)).toContain('b1')
   const asking = $.tool.call({ tool: 'AskUserQuestion', questions: [{ question: 'Merge PR 467?' }] } as never)
+  await atAsk
   const mounted = []
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
@@ -200,7 +207,8 @@ test('many agents in a small panel: whole rows, no squeezing, the rest counted',
   })
   expect(await ui.find({ type: 'Text', text: /15 running/ })).toBeDefined()
   expect(await ui.find({ key: 'row-a15' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /\+10 more not shown/ })).toBeDefined()
+  const head = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.label ?? '')).find(l => l.startsWith('Task 0'))
+  expect(head).toContain('+11 hidden')
   expect(await ui.find({ key: 'row-a1' })).toBeUndefined()
 })
 
@@ -238,6 +246,9 @@ test('a name is never handed out twice in a session: finished agents and the eng
   expect(namesInUse(map, [])).toEqual(['kiki', 'vex'])
   expect(nameFor(namesInUse(map, []))).toBe('vax')
   expect(namesInUse(map, [{ name: 'vax', at: 0 }], [{ name: 'grog' }, {}])).toEqual(['kiki', 'vex', 'grog', 'vax'])
+  // A finished agent that left the panel frees its name; one the engine still runs keeps it.
+  expect(namesInUse({}, [], [{ name: 'kiki', status: 'completed' }, { name: 'vex', status: 'running' }])).toEqual(['vex'])
+  expect(nameFor(namesInUse({}, [], [{ name: 'kiki', status: 'killed' }]))).toBe('kiki')
 })
 
 test('a brief that names itself: the name is read from it, and the prompt always says the name the agent got', () => {
@@ -302,4 +313,48 @@ test('an inline `! cmd`: description ends at the backtick and is labelled by its
   const found = userCommands('Two items in your panel\n- `! bash /tmp/im-history.sh`: the raw webhook bodies, which unblock tapbacks.')
   expect(found).toEqual([{ command: 'bash /tmp/im-history.sh', what: 'the raw webhook bodies, which unblock tapbacks.' }])
   expect(userCommands('Run `! gcloud auth login` now')).toEqual([])
+})
+
+test('work threads: auto titles, order, loose match, and the note beside each prompt', () => {
+  expect(autoTitle('Fix e2e tests group A')).toBe('Fix e2e tests group A')
+  expect(autoTitle('Restore the agents.md guide redirect for every old link we still have')).toBe('Restore the agents.md guide')
+  const t = (id: string, lastAt: number) => ({ id, title: `T ${id}`, auto: false, createdAt: 0, lastAt, archived: { done: 0, failed: 0, cost: 0 } })
+  const list = [t('a', 3), t('b', 1), t('c', 2)]
+  const map = { x: base('x', { thread: 'b' }) }
+  expect(threadOrder(list, map, 'c').map(x => x.id)).toEqual(['c', 'b', 'a'])
+  expect(findThread(list, 't  B')?.id).toBe('b')
+  expect(threadsNote([], '')).toBe('')
+  expect(threadsNote(list, 'c')).toContain('current "T c"; others "T a", "T b"')
+})
+
+test('finished rows stay in their thread an hour (newest few), but free their names after 10 minutes', () => {
+  const min = 60 * 1000
+  const map = {
+    a: base('a', { name: 'kiki', status: 'completed', endedAt: 0, startedAt: 0, thread: 't1' }),
+    b: base('b', { name: 'vex', status: 'completed', endedAt: 30 * min, startedAt: 1, thread: 't1' }),
+    c: base('c', { name: 'vax', status: 'completed', endedAt: 30 * min, startedAt: 2, thread: 't1' }),
+    d: base('d', { name: 'grog', status: 'completed', endedAt: 0, startedAt: 3, thread: 't2' }),
+  }
+  expect(Object.keys(pruneFinished(map, 61 * min, 60 * min, 1)).sort()).toEqual(['c'])
+  expect(Object.keys(pruneFinished(map, 50 * min, 60 * min, 8)).sort()).toEqual(['a', 'b', 'c', 'd'])
+  expect(namesInUse(map, [], [], 50 * min)).toEqual([])
+  expect(namesInUse(map, [], [], 35 * min)).toEqual(['vex', 'vax'])
+})
+
+test('agents join the current thread, their children their parent\'s; the pane shows one dropdown per thread', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  let n = 0
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: `a${++n}` }))
+  await $.agent.spawn({ prompt: 'x', description: 'Fix e2e tests group A', name: 'kiki' } as never)
+  await $.tool.call({ tool: 'mcp__agent-deck__work_thread', title: 'Vingo agent' } as never)
+  await $.agent.spawn({ prompt: 'x', description: 'Vingo nudges', name: 'vex' } as never)
+  await $.agent.spawn({ prompt: 'x', description: 'Nudge child', name: 'vax', parentAgentId: 'a1' } as never)
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck', surface: 'terminal', component: 'Pane', requestId: 'agents',
+    props: { title: 'Agents', isFocused: true, bodyColumns: 56, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  })
+  const heads = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.label ?? ''))
+  expect(heads.some(l => l.startsWith('Fix e2e tests group A · 2 running'))).toBe(true)
+  expect(heads.some(l => l.startsWith('Vingo agent · 1 running'))).toBe(true)
 })
