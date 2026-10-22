@@ -392,7 +392,9 @@ async function clearOld($: EngineInterface): Promise<string> {
   const left = res.kept.map(t => `${t.id === cur ? '* ' : '  '}${t.title}`).join('\n')
   const cleared = res.removed.length
     ? `Cleared ${res.removed.length} thread${res.removed.length === 1 ? '' : 's'} (${res.removed.map(t => `"${t.title}"`).join(', ')}) and ${res.rows.length} finished agent row${res.rows.length === 1 ? '' : 's'}.`
-    : 'No old threads to clear.'
+    : res.rows.length
+      ? `Cleared ${res.rows.length} finished agent row${res.rows.length === 1 ? '' : 's'}.`
+      : 'No old threads to clear.'
   return `${cleared}\nThreads left${res.kept.length ? `:\n${left}` : ': none'}`
 }
 
