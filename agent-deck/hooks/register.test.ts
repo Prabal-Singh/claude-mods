@@ -427,7 +427,7 @@ test('/deck clear: finished rows go at once, live ones and their parents stay', 
   expect(JSON.stringify(out)).toContain('No finished agents to clear')
 })
 
-test('clearing threads keeps the current one and any with a live agent, and takes the ended rows of the rest', () => {
+test('clearing threads keeps the current one and any with a live agent, and takes the ended rows of the rest and of "Other"', () => {
   const t = (id: string) => ({ id, title: `T ${id}`, auto: false, createdAt: 0, lastAt: 0, archived: { done: 0, failed: 0, cost: 0 } })
   const list = [t('cur'), t('busy'), t('waits'), t('old'), t('older')]
   const map = {
@@ -442,7 +442,7 @@ test('clearing threads keeps the current one and any with a live agent, and take
   const out = clearThreads(list, map, 'cur')
   expect(out.kept.map(x => x.id)).toEqual(['cur', 'busy', 'waits'])
   expect(out.removed.map(x => x.id)).toEqual(['old', 'older'])
-  expect(out.rows.sort()).toEqual(['d', 'e'])
+  expect(out.rows.sort()).toEqual(['d', 'e', 'g'])
   expect(threadsNote(out.kept, 'cur')).toContain('current "T cur"; others "T busy", "T waits".')
 })
 

@@ -367,13 +367,14 @@ async function threadFor($: EngineInterface, parentId: string | null, descriptio
 }
 
 // What `clear` keeps: the current thread and any thread with a live agent. Removed threads take their (ended) rows
-// with them, so they do not fall under "Other".
+// with them, and ended rows under "Other" go as well.
 export function clearThreads(list: readonly Thread[], map: AgentMap, current: string): { kept: Thread[]; removed: Thread[]; rows: string[] } {
   const live = new Set(Object.values(map).filter(isLive).map(r => r.thread))
   const kept = list.filter(t => t.id === current || live.has(t.id))
   const removed = list.filter(t => !kept.includes(t))
-  const gone = new Set(removed.map(t => t.id))
-  const rows = Object.values(map).filter(r => gone.has(r.thread) && !isLive(r)).map(r => r.id)
+  // Ended rows outside the kept threads go too, those under "Other" (no thread, or one already gone) included.
+  const keep = new Set(kept.map(t => t.id))
+  const rows = Object.values(map).filter(r => !keep.has(r.thread) && !isLive(r)).map(r => r.id)
   return { kept, removed, rows }
 }
 
