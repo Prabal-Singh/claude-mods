@@ -17,7 +17,7 @@ they go.
   under it.
 - What it is doing right now (`Edit …/app/x.py`, `Bash pytest -q`).
 - Click a row for the task it was given, tokens in and out, files changed, its last actions and its result.
-- A pop-up when an agent finishes or fails. Finished agents take one line and leave the panel 10 minutes later.
+- A pop-up when an agent finishes or fails. Finished agents take one line and leave the panel 5 minutes later.
 - Many agents: rows are cut whole, never squeezed. Running agents come first, then "+N more not shown".
 
 **Bottom half: Blocked on you.** Everything that stops progress until you act:
@@ -49,8 +49,8 @@ own view: `/tasks`, pick the agent, Enter.
 ▸ closed; click its header) with its title, how many agents run, are done or failed, and its spend; its agents and
 their subagents sit under it. Claude switches threads with the `work_thread` tool when you change topic, asks you with
 options when it is unclear which topic a request belongs to, and a thread it never named gets an auto title from its
-first agent's task. **`/thread <title>`** switches (or starts) one yourself; `/thread` lists them. Finished agents
-stay in their thread for an hour (the newest 8), then only count in its header.
+first agent's task. **`/thread <title>`** switches (or starts) one yourself; `/thread` lists them; **`/thread clear`** removes every thread but the current one and those with a running agent, with their finished agents. Finished agents
+stay in their thread for 5 minutes (the newest 8), then only count in its header.
 
 **Subagents may spawn subagents.** Every subagent prompt says so, and agents are told to hand off parts that split
 cleanly.

@@ -10,11 +10,11 @@ const STUCK_MS = 5 * 60 * 1000
 // "Blocked on you" items go away by themselves after this long: commands read from a reply, and flagged items.
 const REPLY_COMMAND_TTL_MS = 2 * 60 * 60 * 1000
 const FLAG_TTL_MS = 24 * 60 * 60 * 1000
-// Finished agents leave the panel this long after they end (their pop-up already said how it went).
+// A finished agent's name is free again this long after it ends.
 const DONE_TTL_MS = 10 * 60 * 1000
-// Finished rows stay in their thread's dropdown this long (their names are free after DONE_TTL_MS), at most
-// KEEP_PER_THREAD of them per thread; older ones only add to the thread's counts.
-const KEEP_MS = 60 * 60 * 1000
+// Finished rows leave the panel this long after they end (their pop-up already said how it went), and at most
+// KEEP_PER_THREAD of them stay per thread; gone ones only add to the thread's counts.
+const KEEP_MS = 5 * 60 * 1000
 const KEEP_PER_THREAD = 8
 const MAY_SPAWN =
   '\n\nYou may spawn your own subagents (Agent tool) for parts of this task that split cleanly; give each a precise brief.'
@@ -366,6 +366,35 @@ async function threadFor($: EngineInterface, parentId: string | null, descriptio
   return (await setThread($, autoTitle(description), { auto: true })).id
 }
 
+// What `clear` keeps: the current thread and any thread with a live agent. Removed threads take their (ended) rows
+// with them, so they do not fall under "Other".
+export function clearThreads(list: readonly Thread[], map: AgentMap, current: string): { kept: Thread[]; removed: Thread[]; rows: string[] } {
+  const live = new Set(Object.values(map).filter(isLive).map(r => r.thread))
+  const kept = list.filter(t => t.id === current || live.has(t.id))
+  const removed = list.filter(t => !kept.includes(t))
+  const gone = new Set(removed.map(t => t.id))
+  const rows = Object.values(map).filter(r => gone.has(r.thread) && !isLive(r)).map(r => r.id)
+  return { kept, removed, rows }
+}
+
+// Applies clearThreads to the state and says what went and what is left.
+async function clearOld($: EngineInterface): Promise<string> {
+  const cur = await read($, currentThread)
+  const res = clearThreads(await read($, threads), await read($, agents), cur)
+  const gone = new Set(res.removed.map(t => t.id))
+  const rows = new Set(res.rows)
+  await update($, threads, l => l.filter(t => !gone.has(t.id)))
+  await update($, agents, m => Object.fromEntries(Object.entries(m).filter(([id]) => !rows.has(id))))
+  await update($, threadOpen, o => Object.fromEntries(Object.entries(o).filter(([id]) => !gone.has(id))))
+  const at = await $.clock.now()
+  await update($, now, () => at)
+  const left = res.kept.map(t => `${t.id === cur ? '* ' : '  '}${t.title}`).join('\n')
+  const cleared = res.removed.length
+    ? `Cleared ${res.removed.length} thread${res.removed.length === 1 ? '' : 's'} (${res.removed.map(t => `"${t.title}"`).join(', ')}) and ${res.rows.length} finished agent row${res.rows.length === 1 ? '' : 's'}.`
+    : 'No old threads to clear.'
+  return `${cleared}\nThreads left${res.kept.length ? `:\n${left}` : ': none'}`
+}
+
 // Rows leaving the panel still count in their thread's header.
 async function archive($: EngineInterface, gone: readonly AgentRow[]): Promise<void> {
   if (!gone.length) return
@@ -677,7 +706,7 @@ export const register: Register = on => {
         await note($, `FAIL ${name}: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
-    await step('command deck', () => $.command.register({ name: 'deck', description: 'Show or hide the Agents panel (subagents and what is blocked on you)' }))
+    await step('command deck', () => $.command.register({ name: 'deck', description: 'Show or hide the Agents panel; /deck clear removes finished agents', argumentHint: '[clear]' }))
     await step('command agent', () => $.command.register({
       name: 'agent',
       description: 'Jump to a subagent by name in the Agents panel (/tell <name> <message> to message it)',
@@ -707,22 +736,23 @@ export const register: Register = on => {
     }))
     await step('command thread', () => $.command.register({
       name: 'thread',
-      description: 'Switch work thread (topic) for new subagents, or list them: /thread [title]',
-      argumentHint: '[title]',
+      description: 'Switch work thread (topic) for new subagents, or list them: /thread [title]; /thread clear removes old ones',
+      argumentHint: '[title | clear]',
     }))
     await step('tool work_thread', () => $.tool.register({
       name: THREAD_TOOL,
       description:
         'Set the work thread (topic) that new subagents belong to; the Agents panel groups agents by thread. A title that ' +
-        'matches an existing thread switches back to it, a new title starts one, `rename: true` renames the current one. ' +
-        'Returns every thread.',
+        'matches an existing thread switches back to it, a new title starts one, `rename: true` renames the current one, ' +
+        '`clear: true` (no title needed) removes every thread but the current one and those with a running agent, with ' +
+        'their finished agents. Returns every thread.',
       inputSchema: {
         type: 'object',
         properties: {
           title: { type: 'string', description: '2-5 words naming the topic, e.g. "Vingo WhatsApp agent".' },
           rename: { type: 'boolean', description: 'Rename the current thread instead of switching.' },
+          clear: { type: 'boolean', description: 'Remove old threads: all but the current one and those with a running agent.' },
         },
-        required: ['title'],
       },
       isDeferred: false,
     }))
@@ -761,7 +791,19 @@ export const register: Register = on => {
     return next({ ...e, context: [...(e.context ?? []), ...notes] })
   }).catch(($, e, next) => next(e))
 
-  on('command.run', { command: 'deck' }, async $ => {
+  on('command.run', { command: 'deck' }, async ($, e) => {
+    if (e.args.trim() === 'clear') {
+      // Finished agents now, instead of an hour after they end; live ones and their parents stay.
+      await tick($)
+      const at = await $.clock.now()
+      const before = await read($, agents)
+      const kept = pruneFinished(before, at, 0)
+      const gone = Object.values(before).filter(r => !kept[r.id])
+      await update($, agents, cur => Object.fromEntries(Object.entries(cur).filter(([id]) => kept[id] || !before[id])))
+      await archive($, gone)
+      await update($, now, () => at)
+      return { text: gone.length ? `Cleared ${gone.length} finished agent${gone.length === 1 ? '' : 's'}.` : 'No finished agents to clear.' }
+    }
     const open = (await $.ui.panes()).some(p => p.id === PANE)
     if (open) {
       await update($, opened, () => false)
@@ -835,6 +877,7 @@ export const register: Register = on => {
   on('tool.call', { tool: THREAD_FULL }, async ($, e) => {
     const input = e as unknown as Record<string, unknown>
     if (e.agentId) return { result: 'Subagents stay in their parent\'s work thread; nothing changed.' }
+    if (input.clear === true) return { result: await clearOld($) }
     const title = typeof input.title === 'string' ? input.title : ''
     if (!title.trim()) return { result: 'Give a title.' }
     const t = await setThread($, title, { rename: input.rename === true })
@@ -849,6 +892,7 @@ export const register: Register = on => {
       const cur = await read($, currentThread)
       return { text: list.length ? `Work threads:\n${list.map(t => `${t.id === cur ? '* ' : '  '}${t.title}`).join('\n')}\n/thread <title> switches or starts one.` : 'No work threads yet. /thread <title> starts one.' }
     }
+    if (title === 'clear') return { text: await clearOld($) }
     const t = await setThread($, title)
     await update($, threadOpen, o => ({ ...o, [t.id]: true }))
     return { text: `Work thread: ${t.title}. New subagents join it.` }

@@ -1,12 +1,12 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-import { NAMES, autoTitle, findThread, threadOrder, threadsNote, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, heldNames, pickName, nextNames, newestId, renameIn, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, treeLines } from './register'
+import { NAMES, autoTitle, clearThreads, findThread, threadOrder, threadsNote, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, heldNames, pickName, nextNames, newestId, renameIn, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, treeLines } from './register'
 import type { AgentRow } from '../types'
 
 const base = (id: string, over: Partial<AgentRow> = {}): AgentRow => ({
   id, name: id, description: `task ${id}`, type: 'general-purpose', parentId: null, model: 'claude-opus-5-5', status: 'running',
   prompt: 'do it', startedAt: 0, endedAt: null, lastActivity: 0, tools: 0, current: '', recent: [], files: [],
-  tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, result: '', alerted: false, stuckAlerted: false, joinedLate: false,
+  tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, result: '', alerted: false, stuckAlerted: false, joinedLate: false, thread: '',
   ...over,
 })
 
@@ -412,4 +412,61 @@ test('a taken name: the brief and description are rewritten to the name the agen
   expect(call.name).toBe('vex')
   expect(call.description).toBe('vex: deploy Vingo')
   expect(call.prompt).toBe('You are vex. When done, report as vex.\n\nYour name in this session is vex.')
+})
+
+test('/deck clear: finished rows go at once, live ones and their parents stay', async ($, on) => {
+  const map = {
+    done: base('done', { status: 'completed', endedAt: 1000 }),
+    live: base('live'),
+    parent: base('parent', { status: 'completed', endedAt: 1000 }),
+    kid: base('kid', { parentId: 'parent' }),
+  }
+  expect(Object.keys(pruneFinished(map, 1001, 0)).sort()).toEqual(['kid', 'live', 'parent'])
+  mock.clock(on, { now: 1000 })
+  const out = await $.command.run({ command: 'deck', args: 'clear' } as never)
+  expect(JSON.stringify(out)).toContain('No finished agents to clear')
+})
+
+test('clearing threads keeps the current one and any with a live agent, and takes the ended rows of the rest', () => {
+  const t = (id: string) => ({ id, title: `T ${id}`, auto: false, createdAt: 0, lastAt: 0, archived: { done: 0, failed: 0, cost: 0 } })
+  const list = [t('cur'), t('busy'), t('waits'), t('old'), t('older')]
+  const map = {
+    a: base('a', { thread: 'busy' }),
+    b: base('b', { thread: 'busy', status: 'completed', endedAt: 1 }),
+    c: base('c', { thread: 'waits', status: 'waiting' }),
+    d: base('d', { thread: 'old', status: 'completed', endedAt: 1 }),
+    e: base('e', { thread: 'old', status: 'failed', endedAt: 1 }),
+    f: base('f', { thread: 'cur', status: 'completed', endedAt: 1 }),
+    g: base('g', { thread: '', status: 'completed', endedAt: 1 }),
+  }
+  const out = clearThreads(list, map, 'cur')
+  expect(out.kept.map(x => x.id)).toEqual(['cur', 'busy', 'waits'])
+  expect(out.removed.map(x => x.id)).toEqual(['old', 'older'])
+  expect(out.rows.sort()).toEqual(['d', 'e'])
+  expect(threadsNote(out.kept, 'cur')).toContain('current "T cur"; others "T busy", "T waits".')
+})
+
+test('work_thread clear: says what went and what is left; the next prompt\'s note lists only what is left', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  await $.tool.call({ tool: 'mcp__agent-deck__work_thread', title: 'Old topic' } as never)
+  await $.tool.call({ tool: 'mcp__agent-deck__work_thread', title: 'Vingo agent' } as never)
+  const out = await $.tool.call({ tool: 'mcp__agent-deck__work_thread', clear: true } as never)
+  const text = JSON.stringify(out)
+  expect(text).toContain('Cleared 1 thread (\\"Old topic\\")')
+  expect(text).toContain('* Vingo agent')
+  const again = await $.command.run({ command: 'thread', args: 'clear' } as never)
+  expect(JSON.stringify(again)).toContain('No old threads to clear.')
+  const list = await $.command.run({ command: 'thread', args: '' } as never)
+  expect(JSON.stringify(list)).not.toContain('Old topic')
+})
+
+test('a subagent cannot clear threads', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  await $.tool.call({ tool: 'mcp__agent-deck__work_thread', title: 'Old topic' } as never)
+  await $.tool.call({ tool: 'mcp__agent-deck__work_thread', title: 'Vingo agent' } as never)
+  const out = await $.tool.call({ tool: 'mcp__agent-deck__work_thread', clear: true, agentId: 'sub1' } as never)
+  expect(JSON.stringify(out)).toContain('nothing changed')
+  const list = await $.command.run({ command: 'thread', args: '' } as never)
+  expect(JSON.stringify(list)).toContain('Old topic')
 })
