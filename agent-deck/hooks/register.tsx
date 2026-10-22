@@ -792,7 +792,7 @@ export const register: Register = on => {
     const notes = [await namesNote($), threadsNote(await read($, threads), await read($, currentThread)), open.length ? openItemsNote(open) : ''].filter(Boolean)
     if (!notes.length) return next(e)
     return next({ ...e, context: [...(e.context ?? []), ...notes] })
-  }).catch(($, e, next) => next(e))
+  })
 
   on('command.run', { command: 'deck' }, async ($, e) => {
     if (e.args.trim() === 'clear') {
@@ -848,7 +848,7 @@ export const register: Register = on => {
     } catch {}
     const mine = agentSuggestions(e.text.slice(0, e.cursor ?? e.text.length), e.start, e.token ?? '', agentsByName(await read($, agents), listed))
     return mine.length ? { ...result, suggestions: [...mine, ...result.suggestions] } : result
-  }).catch(($, e, next) => next(e))
+  })
 
   on('agent.spawn', async ($, e, next) => {
     const prompt = e.prompt.includes(MAY_SPAWN.trim()) ? e.prompt : e.prompt + MAY_SPAWN
@@ -875,7 +875,7 @@ export const register: Register = on => {
     await update($, now, () => at)
     if (!(await read($, opened))) await openPane($)
     return result
-  }).catch(($, e, next) => next(e))
+  })
 
   on('tool.call', { tool: THREAD_FULL }, async ($, e) => {
     const input = e as unknown as Record<string, unknown>
@@ -1003,7 +1003,7 @@ export const register: Register = on => {
       // The call ran (or was refused): a permission prompt for this tool is over.
       await dropBlocker($, b => b.kind === 'permission' && b.id === `perm-${e.tool}${who ? `-${who}` : ''}`)
     }
-  }).catch(($, e, next) => next(e))
+  })
 
   on('classic.PermissionRequest', async ($, e, next) => {
     const input = (e.tool_input ?? {}) as Record<string, unknown>
@@ -1017,7 +1017,7 @@ export const register: Register = on => {
       auto: true,
     })
     return next(e)
-  }).catch(($, e, next) => next(e))
+  })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
