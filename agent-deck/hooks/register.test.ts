@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-import { NAMES, autoTitle, clearThreads, findThread, threadOrder, threadsNote, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, heldNames, pickName, nextNames, newestId, renameIn, openItemsNote, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, treeLines } from './register'
+import { NAMES, autoTitle, clearThreads, findThread, threadOrder, threadsNote, actionLabel, adoptRows, agentSuggestions, agentsByName, claimedName, commandKey, namedPrompt, heldNames, pickName, nextNames, newestId, renameIn, openItemsNote, syncedRow, markActive, pruneFinished, ranCommand, userCommands, costOf, editedPath, elapsed, glyph, treeLines } from './register'
 import type { AgentRow } from '../types'
 
 const base = (id: string, over: Partial<AgentRow> = {}): AgentRow => ({
@@ -469,4 +469,21 @@ test('a subagent cannot clear threads', async ($, on) => {
   expect(JSON.stringify(out)).toContain('nothing changed')
   const list = await $.command.run({ command: 'thread', args: '' } as never)
   expect(JSON.stringify(list)).toContain('Old topic')
+})
+
+test('an ended row stays ended while the engine still lists it as running or waiting; only new work revives it', () => {
+  const H = 60 * 60 * 1000
+  const done = base('a', { status: 'completed', endedAt: 100, lastActivity: 100 })
+  expect(syncedRow(done, 'running', 200)).toBe(done)
+  expect(syncedRow(done, 'waiting', 200)).toBe(done)
+  const back = markActive(done, 300)
+  expect(back.status).toBe('running')
+  expect(back.endedAt).toBe(null)
+  const live = base('b', { status: 'running', lastActivity: 1000 })
+  expect(syncedRow(live, 'running', 2000)).toBe(live)
+  expect(syncedRow(live, 'waiting', 2000).status).toBe('waiting')
+  expect(syncedRow(live, 'completed', 2000)).toMatchObject({ status: 'completed', endedAt: 2000 })
+  // Waiting on a background shell that never ends: no tool call for an hour, so it has ended.
+  expect(syncedRow(live, 'waiting', 1000 + H + 1)).toMatchObject({ status: 'idle', endedAt: 1000 })
+  expect(syncedRow(live, 'waiting', 1000 + H - 1).status).toBe('waiting')
 })

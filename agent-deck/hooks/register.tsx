@@ -7,6 +7,8 @@ const PANE = 'agents'
 const TITLE = 'Agents'
 const TICK_MS = 2000
 const STUCK_MS = 5 * 60 * 1000
+// A live row with no tool call this long has ended, whatever the engine's list says (no one tool call waits this long).
+const STALE_MS = 60 * 60 * 1000
 // "Blocked on you" items go away by themselves after this long: commands read from a reply, and flagged items.
 const REPLY_COMMAND_TTL_MS = 2 * 60 * 60 * 1000
 const FLAG_TTL_MS = 24 * 60 * 60 * 1000
@@ -418,6 +420,23 @@ async function archive($: EngineInterface, gone: readonly AgentRow[]): Promise<v
   )
 }
 
+// A row after the engine's list says `status`. The list may say "running" long after a turn ended (an agent with a
+// background shell or Monitor left behind is listed as running for good: 8 Nov 2026, five finished agents showed as
+// running for a day). So the list may end a row, but never brings an ended one back; only new work does (a tool
+// call after the end, see markActive). A live row with no activity for STALE_MS is taken as ended too.
+export function syncedRow(row: AgentRow, status: string, at: number): AgentRow {
+  const live = (s: string) => ['running', 'pending', 'waiting'].includes(s)
+  if (!isLive(row)) return row
+  if (!live(status)) return row.status === status ? row : { ...row, status, endedAt: row.endedAt ?? at }
+  if (at - row.lastActivity > STALE_MS) return { ...row, status: 'idle', endedAt: row.lastActivity, current: '' }
+  return row.status === status ? row : { ...row, status }
+}
+
+// A tool call from an ended row is a resumed agent (SendMessage, or its own background work woke it): live again.
+export function markActive(row: AgentRow, at: number): AgentRow {
+  return isLive(row) ? row : { ...row, status: 'running', endedAt: null, stuckAlerted: false, lastActivity: at }
+}
+
 // Agents this mod never saw spawn (they started before it loaded): add them from the engine's list.
 export function adoptRows(map: AgentMap, listed: readonly AgentInfoLike[], at: number): AgentRow[] {
   return listed
@@ -675,10 +694,11 @@ async function tick($: EngineInterface): Promise<void> {
   await update($, now, () => at)
   for (const info of listed) {
     const row = (await read($, agents))[info.id]
-    if (!row || row.status === info.status) continue
-    await patch($, info.id, r => ({ ...r, status: info.status, endedAt: isLive({ ...r, status: info.status }) ? null : r.endedAt ?? at }))
-    const after = (await read($, agents))[info.id]
-    if (after) await remember($, info.id, { endedAt: after.endedAt })
+    if (!row) continue
+    const next = syncedRow(row, info.status, at)
+    if (next === row) continue
+    await patch($, info.id, () => next)
+    await remember($, info.id, { endedAt: next.endedAt })
   }
   // A row still running whose agent the engine no longer lists has ended; without this it stayed in the panel for good.
   const ids = new Set(listed.map(info => info.id))
@@ -973,7 +993,7 @@ export const register: Register = on => {
       const path = editedPath(e.tool, args)
       const at = await $.clock.now()
       await patch($, id, r => ({
-        ...r,
+        ...markActive(r, at),
         tools: r.tools + 1,
         current: label,
         recent: [...r.recent, label].slice(-5),
